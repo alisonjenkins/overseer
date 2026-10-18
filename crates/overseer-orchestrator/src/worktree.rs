@@ -75,6 +75,32 @@ pub fn worktree_path(state_dir: &Path, task_id: TaskId) -> PathBuf {
     state_dir.join("worktrees").join(format!("task-{task_id}"))
 }
 
+/// Check whether every commit on `branch` is already on `HEAD`.
+///
+/// Runs `git cherry HEAD <branch>` in `repo`. A `-` line is a commit whose
+/// patch is already on HEAD; a branch whose commits are reachable from HEAD
+/// (a fast-forward merge) prints nothing. Both count as merged. Returns false
+/// only when some line starts with `+`.
+pub fn branch_content_on_head(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let command = format!("cherry HEAD {branch}");
+    let output = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["cherry", "HEAD", branch])
+        .output()
+        .map_err(|source| WorktreeError::SpawnGit {
+            command: command.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(WorktreeError::GitFailed {
+            command,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(!stdout.lines().any(|line| line.starts_with('+')))
+}
+
 /// Create `<state_dir>/worktrees/task-<id>` on a new branch
 /// `overseer/task-<id>`, starting from the repository's current HEAD.
 pub async fn create(
@@ -858,5 +884,74 @@ mod tests {
             paths,
             vec!["Cargo.toml".to_owned(), "src/lib.rs".to_owned()]
         );
+    }
+
+    #[test]
+    fn branch_content_on_head_returns_true_when_commit_cherry_picked_onto_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        git_sync(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "feature commit"]);
+
+        let commit = git_sync(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        git_sync(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "main commit"]);
+        git_sync(&repo, &["cherry-pick", &commit]);
+
+        assert!(branch_content_on_head(&repo, "feature").unwrap());
+    }
+
+    #[test]
+    fn branch_content_on_head_returns_true_when_branch_fast_forwarded_into_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        git_sync(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "feature commit"]);
+
+        git_sync(&repo, &["checkout", "main"]);
+        git_sync(&repo, &["merge", "--ff-only", "feature"]);
+
+        assert!(branch_content_on_head(&repo, "feature").unwrap());
+    }
+
+    #[test]
+    fn branch_content_on_head_returns_false_when_commit_not_on_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        git_sync(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "feature commit"]);
+
+        git_sync(&repo, &["checkout", "main"]);
+
+        assert!(!branch_content_on_head(&repo, "feature").unwrap());
+    }
+
+    #[test]
+    fn branch_content_on_head_returns_true_when_no_commits_beyond_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        git_sync(&repo, &["branch", "feature"]);
+
+        assert!(branch_content_on_head(&repo, "feature").unwrap());
     }
 }

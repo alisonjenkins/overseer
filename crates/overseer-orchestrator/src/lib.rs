@@ -35,6 +35,6 @@ pub use runner::{
 };
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
 pub use worktree::{
-    MergeError, Worktree, WorktreeError, branch_name, diff, diff_stat, discard, merge,
-    remove_worktree, worktree_path,
+    MergeError, Worktree, WorktreeError, branch_content_on_head, branch_name, diff, diff_stat,
+    discard, merge, remove_worktree, worktree_path,
 };
