@@ -262,4 +262,11 @@ pub enum StoreError {
         #[source]
         source: Box<rusqlite::Error>,
     },
+
+    #[error("failed to get progress for source {task_source:?}")]
+    ProgressBySource {
+        task_source: Box<str>,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
 }

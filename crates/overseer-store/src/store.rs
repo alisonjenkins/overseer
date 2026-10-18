@@ -256,6 +256,48 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Returns (done, total) counts per external-id prefix for a given source,
+    /// where total excludes cancelled tasks.
+    pub fn progress_by_source(
+        &self,
+        source: &str,
+    ) -> Result<Vec<(String, usize, usize)>, StoreError> {
+        let err_fn = |err| StoreError::ProgressBySource {
+            task_source: source.into(),
+            source: Box::new(err),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT \
+                 CASE WHEN instr(external_id, '/') > 0 \
+                      THEN substr(external_id, 1, instr(external_id, '/') - 1) \
+                      ELSE external_id \
+                 END AS prefix, \
+                 COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS done_count, \
+                 COUNT(*) AS total_count \
+                 FROM tasks \
+                 WHERE source = ?1 AND external_id IS NOT NULL AND status != 'cancelled' \
+                 GROUP BY prefix \
+                 ORDER BY prefix ASC",
+            )
+            .map_err(err_fn)?;
+
+        stmt.query_map(params![source], |row| {
+            let prefix: String = row.get(0)?;
+            let done: i64 = row.get(1)?;
+            let total: i64 = row.get(2)?;
+            Ok((
+                prefix,
+                usize::try_from(done.max(0)).unwrap_or(0),
+                usize::try_from(total.max(0)).unwrap_or(0),
+            ))
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(err_fn)
+    }
+
     /// Returns the counts of tasks grouped by status for all task statuses.
     pub fn task_counts_by_status(&self) -> Result<Vec<(TaskStatus, usize)>, StoreError> {
         let mut counts = std::collections::HashMap::new();
@@ -2029,6 +2071,74 @@ mod tests {
         assert!(
             matches!(err, StoreError::UnknownTask { id } if id == TaskId::new(999)),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn progress_by_source_groups_by_prefix_and_excludes_cancelled() {
+        let mut store = memory_store();
+
+        // Prefix 001: 2 done, 1 ready
+        let t1 = store
+            .add_task(NewTask {
+                source: Some("speckit".to_owned()),
+                external_id: Some("001-setup/T001".to_owned()),
+                ..new_task("setup 1", 0)
+            })
+            .unwrap();
+        store.set_status(t1.id, TaskStatus::Done).unwrap();
+
+        let t2 = store
+            .add_task(NewTask {
+                source: Some("speckit".to_owned()),
+                external_id: Some("001-setup/T002".to_owned()),
+                ..new_task("setup 2", 0)
+            })
+            .unwrap();
+        store.set_status(t2.id, TaskStatus::Done).unwrap();
+
+        let _t3 = store
+            .add_task(NewTask {
+                source: Some("speckit".to_owned()),
+                external_id: Some("001-setup/T003".to_owned()),
+                ..new_task("setup 3", 0)
+            })
+            .unwrap();
+
+        // Prefix 002: 1 ready, 1 cancelled
+        let _t4 = store
+            .add_task(NewTask {
+                source: Some("speckit".to_owned()),
+                external_id: Some("002-feature/T001".to_owned()),
+                ..new_task("feat 1", 0)
+            })
+            .unwrap();
+
+        let t5 = store
+            .add_task(NewTask {
+                source: Some("speckit".to_owned()),
+                external_id: Some("002-feature/T002".to_owned()),
+                ..new_task("feat 2", 0)
+            })
+            .unwrap();
+        store.set_status(t5.id, TaskStatus::Cancelled).unwrap();
+
+        // Task from different source
+        let _t_other = store
+            .add_task(NewTask {
+                source: Some("other".to_owned()),
+                external_id: Some("001-setup/T999".to_owned()),
+                ..new_task("other", 0)
+            })
+            .unwrap();
+
+        let progress = store.progress_by_source("speckit").unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                ("001-setup".to_string(), 2, 3),
+                ("002-feature".to_string(), 0, 1),
+            ]
         );
     }
 }

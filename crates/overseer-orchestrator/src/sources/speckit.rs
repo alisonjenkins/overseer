@@ -72,6 +72,7 @@ struct InProgressTask {
     full_desc: String,
     continuations: Vec<String>,
     phase: Option<String>,
+    done: bool,
 }
 
 fn finish_task(
@@ -100,6 +101,7 @@ fn finish_task(
         body,
         profile: profile.map(str::to_owned),
         ready,
+        done: task.done,
     });
 }
 
@@ -153,7 +155,17 @@ fn parse_tasks_md(
             current_phase = Some(phase.to_string());
             continue;
         }
-        if let Some(after_box) = trimmed_start.strip_prefix("- [ ] ") {
+        let task_box = trimmed_start
+            .strip_prefix("- [ ] ")
+            .map(|after| (after, false))
+            .or_else(|| {
+                trimmed_start
+                    .strip_prefix("- [x] ")
+                    .or_else(|| trimmed_start.strip_prefix("- [X] "))
+                    .map(|after| (after, true))
+            });
+
+        if let Some((after_box, done)) = task_box {
             flush(&mut in_progress);
             let mut parts = after_box.splitn(2, char::is_whitespace);
             let id = parts.next().unwrap_or_default();
@@ -167,12 +179,9 @@ fn parse_tasks_md(
                     full_desc,
                     continuations: Vec::new(),
                     phase: current_phase.clone(),
+                    done,
                 });
             }
-            continue;
-        }
-        if trimmed_start.starts_with("- [x] ") || trimmed_start.starts_with("- [X] ") {
-            flush(&mut in_progress);
             continue;
         }
         if let Some(ref mut task) = in_progress {
@@ -197,7 +206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_fixture_returns_only_unchecked_tasks_with_stripped_markers() {
+    fn parse_fixture_returns_tasks_with_done_flag_and_stripped_markers() {
         let root = tempfile::tempdir().unwrap();
         let spec_dir = root.path().join("001-virtual-output-projection");
         std::fs::create_dir_all(&spec_dir).unwrap();
@@ -205,9 +214,9 @@ mod tests {
 # Spec: Virtual Output Projection\n\n\
 ## Phase 1: Setup\n\n\
   - [ ] T001 Description text here\n    Continuation line for T001\n\
-  - [x] T002 Already done (must be ignored)\n    Continuation for ignored\n\
+  - [x] T002 Already done line\n    Continuation for done\n\
   - [ ] T003 [P] Description with a parallel marker\n\
-  - [ ] T004 [P] [US1] Description with a story marker\n";
+  - [X] T004 [P] [US1] Description with a story marker\n";
         std::fs::write(spec_dir.join("tasks.md"), tasks_content).unwrap();
 
         let config = SourceConfig {
@@ -221,7 +230,7 @@ mod tests {
         assert_eq!(source.watch_paths(), vec![root.path().to_path_buf()]);
 
         let tasks = source.scan().unwrap();
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         assert_eq!(tasks[0].external_id, "001-virtual-output-projection/T001");
         assert_eq!(tasks[0].title, "Description text here");
         assert!(
@@ -233,16 +242,24 @@ mod tests {
         assert!(tasks[0].body.contains("Continuation line for T001"));
         assert_eq!(tasks[0].profile.as_deref(), Some("worker"));
         assert!(tasks[0].ready);
+        assert!(!tasks[0].done);
 
-        assert_eq!(tasks[1].external_id, "001-virtual-output-projection/T003");
-        assert_eq!(tasks[1].title, "Description with a parallel marker");
-        assert!(!tasks[1].title.contains("[P]"));
+        assert_eq!(tasks[1].external_id, "001-virtual-output-projection/T002");
+        assert_eq!(tasks[1].title, "Already done line");
+        assert!(tasks[1].body.contains("Continuation for done"));
+        assert!(tasks[1].done);
 
-        assert_eq!(tasks[2].external_id, "001-virtual-output-projection/T004");
-        assert_eq!(tasks[2].title, "Description with a story marker");
+        assert_eq!(tasks[2].external_id, "001-virtual-output-projection/T003");
+        assert_eq!(tasks[2].title, "Description with a parallel marker");
         assert!(!tasks[2].title.contains("[P]"));
-        assert!(!tasks[2].title.contains("[US1]"));
-        assert!(tasks[2].body.contains("Story: [US1]"));
+        assert!(!tasks[2].done);
+
+        assert_eq!(tasks[3].external_id, "001-virtual-output-projection/T004");
+        assert_eq!(tasks[3].title, "Description with a story marker");
+        assert!(!tasks[3].title.contains("[P]"));
+        assert!(!tasks[3].title.contains("[US1]"));
+        assert!(tasks[3].body.contains("Story: [US1]"));
+        assert!(tasks[3].done);
     }
 
     #[test]

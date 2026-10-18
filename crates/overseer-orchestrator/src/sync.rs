@@ -44,7 +44,7 @@ pub fn sync_sources(
             let existing = store.find_task_by_external_id(source_name, &task.external_id)?;
             match existing {
                 None => {
-                    store.add_task(NewTask {
+                    let created = store.add_task(NewTask {
                         title: task.title,
                         body: task.body,
                         priority: 0,
@@ -54,27 +54,57 @@ pub fn sync_sources(
                         source: Some(source_name.to_string()),
                         external_id: Some(task.external_id),
                     })?;
+                    if task.done {
+                        store.set_status(created.id, TaskStatus::Done)?;
+                    }
                     report.added = report.added.saturating_add(1);
                 }
-                Some(existing) => match existing.status {
-                    TaskStatus::Cancelled => {
-                        let new_status = if task.ready {
-                            TaskStatus::Ready
-                        } else {
-                            TaskStatus::Backlog
-                        };
-                        store.set_status(existing.id, new_status)?;
-                        store.set_task_title_and_body(existing.id, &task.title, &task.body)?;
-                        report.revived = report.revived.saturating_add(1);
+                Some(existing) => {
+                    if task.done {
+                        match existing.status {
+                            TaskStatus::Backlog | TaskStatus::Ready | TaskStatus::Cancelled => {
+                                store.set_status(existing.id, TaskStatus::Done)?;
+                                if existing.title != task.title || existing.body != task.body {
+                                    store.set_task_title_and_body(
+                                        existing.id,
+                                        &task.title,
+                                        &task.body,
+                                    )?;
+                                }
+                                report.updated = report.updated.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match existing.status {
+                            TaskStatus::Cancelled => {
+                                let new_status = if task.ready {
+                                    TaskStatus::Ready
+                                } else {
+                                    TaskStatus::Backlog
+                                };
+                                store.set_status(existing.id, new_status)?;
+                                store.set_task_title_and_body(
+                                    existing.id,
+                                    &task.title,
+                                    &task.body,
+                                )?;
+                                report.revived = report.revived.saturating_add(1);
+                            }
+                            TaskStatus::Backlog | TaskStatus::Ready
+                                if existing.title != task.title || existing.body != task.body =>
+                            {
+                                store.set_task_title_and_body(
+                                    existing.id,
+                                    &task.title,
+                                    &task.body,
+                                )?;
+                                report.updated = report.updated.saturating_add(1);
+                            }
+                            _ => {}
+                        }
                     }
-                    TaskStatus::Backlog | TaskStatus::Ready
-                        if existing.title != task.title || existing.body != task.body =>
-                    {
-                        store.set_task_title_and_body(existing.id, &task.title, &task.body)?;
-                        report.updated = report.updated.saturating_add(1);
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
@@ -91,7 +121,7 @@ pub fn sync_sources(
                         store.set_status(existing.id, TaskStatus::Cancelled)?;
                         report.cancelled = report.cancelled.saturating_add(1);
                     }
-                    TaskStatus::Cancelled => {}
+                    TaskStatus::Cancelled | TaskStatus::Done => {}
                     other => {
                         report.warnings.push(format!(
                             "task {} has status {other}; cannot cancel",
@@ -266,5 +296,101 @@ mod tests {
             .unwrap();
         assert_eq!(t1.status, TaskStatus::Backlog);
         assert_eq!(t1.title, "Task 1 Revived");
+    }
+
+    #[test]
+    fn new_checked_line_is_created_as_done_and_not_runnable() {
+        let (root, mut store) = setup("## Phase 1: Setup\n- [x] T001 Task 1\n");
+        let report = sync_sources(&mut store, &[make_source(root.path(), true)]).unwrap();
+        assert_eq!(report.added, 1);
+        let task = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+    }
+
+    #[test]
+    fn backlog_task_becomes_done_when_line_is_checked() {
+        let (root, mut store) = setup("## Phase 1: Setup\n- [ ] T001 Task 1\n");
+        let sources = [make_source(root.path(), false)];
+        sync_sources(&mut store, &sources).unwrap();
+
+        write_tasks(root.path(), "## Phase 1: Setup\n- [x] T001 Task 1\n");
+        let report = sync_sources(&mut store, &sources).unwrap();
+        assert_eq!(report.updated, 1);
+        let task = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn review_task_stays_review_when_line_is_checked() {
+        let (root, mut store) = setup("## Phase 1: Setup\n- [ ] T001 Task 1\n");
+        let sources = [make_source(root.path(), false)];
+        sync_sources(&mut store, &sources).unwrap();
+
+        let task = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        store.set_status(task.id, TaskStatus::Review).unwrap();
+
+        write_tasks(root.path(), "## Phase 1: Setup\n- [x] T001 Task 1\n");
+        let report = sync_sources(&mut store, &sources).unwrap();
+        assert_eq!(report.updated, 0);
+        let task_after = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_after.status, TaskStatus::Review);
+    }
+
+    #[test]
+    fn unchecked_line_for_done_task_stays_done() {
+        let (root, mut store) = setup("## Phase 1: Setup\n- [x] T001 Task 1\n");
+        let sources = [make_source(root.path(), false)];
+        sync_sources(&mut store, &sources).unwrap();
+
+        let task = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+
+        write_tasks(root.path(), "## Phase 1: Setup\n- [ ] T001 Task 1\n");
+        let report = sync_sources(&mut store, &sources).unwrap();
+        assert_eq!((report.updated, report.revived), (0, 0));
+        let task_after = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_after.status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn removed_done_line_is_silent() {
+        let (root, mut store) = setup("## Phase 1: Setup\n- [x] T001 Task 1\n");
+        let sources = [make_source(root.path(), false)];
+        sync_sources(&mut store, &sources).unwrap();
+
+        let task = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+
+        write_tasks(root.path(), "## Phase 1: Setup\n");
+        let report = sync_sources(&mut store, &sources).unwrap();
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.cancelled, 0);
+        let task_after = store
+            .find_task_by_external_id("speckit", "001-spec/T001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_after.status, TaskStatus::Done);
     }
 }

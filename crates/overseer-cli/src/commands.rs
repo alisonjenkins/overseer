@@ -905,16 +905,18 @@ fn run_worker_cmd(
 
 fn run_status(dir: &Path) -> Result<()> {
     let mut store = state::open_existing_store(dir)?;
-    match state::load_config(dir) {
+    let config = match state::load_config(dir) {
         Ok(config) => {
             if let Err(err) = reconcile(&mut store, &config.repo) {
                 eprintln!("warning: reconcile failed: {err:#}");
             }
+            Some(config)
         }
         Err(err) => {
             eprintln!("warning: reconcile failed: {err:#}");
+            None
         }
-    }
+    };
 
     let worker_pid = check_worker_status(dir).context("failed to inspect worker status")?;
     match worker_pid {
@@ -956,6 +958,26 @@ fn run_status(dir: &Path) -> Result<()> {
             run.status.as_str(),
             tokens
         );
+    }
+
+    if let Some(ref config) = config
+        && config.sources.iter().any(|s| s.kind == "speckit")
+    {
+        match store.progress_by_source("speckit") {
+            Ok(mut progress) => {
+                if !progress.is_empty() {
+                    progress.sort_by(|a, b| a.0.cmp(&b.0));
+                    println!();
+                    println!("SPECS");
+                    for (dir, done, total) in progress {
+                        println!("  {dir}  {done}/{total}");
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("warning: failed to get spec progress: {err:#}");
+            }
+        }
     }
 
     Ok(())

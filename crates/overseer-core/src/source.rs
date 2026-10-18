@@ -8,6 +8,7 @@ pub struct SourcedTask {
     pub body: String,
     pub profile: Option<String>,
     pub ready: bool,
+    pub done: bool,
 }
 
 /// An external source of tasks, such as speckit specifications.
