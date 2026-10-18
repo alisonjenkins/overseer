@@ -7,6 +7,7 @@ use crate::{CoreError, Permissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1500;
 const DEFAULT_MAX_STEPS: u32 = 100;
+const DEFAULT_CONTEXT_CHARS: u32 = 48000;
 
 const STARTER_TEMPLATE: &str = r#"# overseer.toml: where task worktrees come from and how tasks are run.
 #
@@ -91,6 +92,8 @@ permissions = "write-workdir"
 timeout_secs = 1500
 # System prompt sent before the task text.
 role_prompt = "You are a careful senior engineer."
+# Character budget for conversation history; local profiles have a 32k token context.
+context_chars = 60000
 # Profiles to try, in order, when this one cannot run. Empty: local ends the chain.
 fallback = []
 # Marks a profile that uses the GPU.
@@ -109,6 +112,8 @@ timeout_secs = 1500
 role_prompt = "You are a careful senior engineer."
 agent_tools = true
 max_steps = 100
+# Character budget for conversation history; local profiles have a 32k token context.
+context_chars = 60000
 fallback = []
 # Marks a profile that uses the GPU.
 gpu = true
@@ -232,6 +237,9 @@ pub struct Profile {
     /// Marks a profile that uses the GPU.
     #[serde(default)]
     pub gpu: bool,
+    /// Character budget for conversation history in the agent tool loop.
+    #[serde(default = "default_context_chars")]
+    pub context_chars: u32,
 }
 
 impl Profile {
@@ -252,6 +260,10 @@ fn default_timeout_secs() -> u64 {
 
 fn default_max_steps() -> u32 {
     DEFAULT_MAX_STEPS
+}
+
+fn default_context_chars() -> u32 {
+    DEFAULT_CONTEXT_CHARS
 }
 
 const DEFAULT_MAX_REWORKS: u8 = 2;
@@ -694,7 +706,30 @@ model = "local"
         assert_eq!(profile.api_key_env, None);
         assert!(!profile.agent_tools);
         assert_eq!(profile.max_steps, 100);
+        assert_eq!(profile.context_chars, 48000);
         assert_eq!(config.repo, PathBuf::from("/work/project"));
+    }
+
+    #[test]
+    fn context_chars_parses_and_defaults() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert_eq!(profile.context_chars, 48000);
+
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+context_chars = 60000
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert_eq!(profile.context_chars, 60000);
     }
 
     #[test]

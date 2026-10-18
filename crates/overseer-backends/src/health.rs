@@ -360,6 +360,7 @@ mod tests {
             max_steps: 40,
             skills: Vec::new(),
             gpu: false,
+            context_chars: 48000,
         }
     }
 
@@ -384,6 +385,7 @@ mod tests {
             max_steps: 40,
             skills: Vec::new(),
             gpu: false,
+            context_chars: 48000,
         }
     }
 

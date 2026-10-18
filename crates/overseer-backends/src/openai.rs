@@ -33,6 +33,7 @@ pub struct OpenAiBackend {
     api_key: ApiKey,
     agent_tools: bool,
     max_steps: u32,
+    context_chars: u32,
 }
 
 impl OpenAiBackend {
@@ -78,6 +79,7 @@ impl OpenAiBackend {
             api_key,
             agent_tools: profile.agent_tools,
             max_steps: profile.max_steps,
+            context_chars: profile.context_chars,
         })
     }
 
@@ -169,6 +171,14 @@ impl OpenAiBackend {
                 });
             }
             steps = steps.saturating_add(1);
+
+            if let Err(kind) = enforce_history_budget(&mut messages, self.context_chars as usize) {
+                return Ok(RunOutcome {
+                    output: String::new(),
+                    usage: total_usage,
+                    failure: Some(kind),
+                });
+            }
 
             let body = json!({
                 "model": self.model,
@@ -330,9 +340,63 @@ fn parse_completion(body: &str) -> RunOutcome {
     }
 }
 
+const ELIDED_TOOL_OUTPUT: &str = "[earlier tool output elided to fit the context budget]";
+
+fn total_message_chars(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .map(|s| s.chars().count())
+        .sum()
+}
+
+fn enforce_history_budget(messages: &mut [Value], budget: usize) -> Result<usize, FailureKind> {
+    let mut total = total_message_chars(messages);
+    let mut elided: usize = 0;
+    if total > budget
+        && let Some(last_ast) = messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+    {
+        for msg in messages.get_mut(..last_ast).unwrap_or(&mut []) {
+            if total <= budget {
+                break;
+            }
+            if msg.get("role").and_then(Value::as_str) == Some("tool")
+                && msg.get("content").and_then(Value::as_str) != Some(ELIDED_TOOL_OUTPUT)
+                && let Some(obj) = msg.as_object_mut()
+            {
+                let old_len = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map_or(0, |s| s.chars().count());
+                obj.insert("content".to_owned(), json!(ELIDED_TOOL_OUTPUT));
+                elided = elided.saturating_add(1);
+                total = total
+                    .saturating_sub(old_len)
+                    .saturating_add(ELIDED_TOOL_OUTPUT.chars().count());
+            }
+        }
+    }
+    if elided > 0 {
+        tracing::info!(elided, "elided earlier tool output to fit context budget");
+    }
+    if total > budget {
+        return Err(FailureKind::Other(
+            "context budget exceeded after eliding tool output".to_owned(),
+        ));
+    }
+    Ok(elided)
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -365,6 +429,7 @@ mod tests {
             max_steps: 40,
             skills: Vec::new(),
             gpu: false,
+            context_chars: 48000,
         }
     }
 
@@ -607,6 +672,7 @@ mod tests {
             max_steps,
             skills: Vec::new(),
             gpu: false,
+            context_chars: 48000,
         }
     }
 
@@ -656,6 +722,15 @@ mod tests {
                 "completion_tokens": completion_tokens
             }
         }))
+    }
+
+    async fn mount_tool_call(server: &MockServer, id: &str, tool: &str, args: &str) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(id, tool, args, 10, 5))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
@@ -1035,5 +1110,167 @@ mod tests {
         assert_eq!(outcome.failure, Some(FailureKind::QuotaExhausted));
         assert_eq!(outcome.usage.input_tokens, 50);
         assert_eq!(outcome.usage.output_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn history_budget_elides_oldest_tool_results() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path();
+
+        let content = ("x".repeat(60) + "\n").repeat(300);
+        for name in ["f1.txt", "f2.txt", "f3.txt"] {
+            std::fs::write(workdir.join(name), &content).unwrap();
+        }
+
+        mount_tool_call(&server, "call_1", "read_file", r#"{"path": "f1.txt"}"#).await;
+        mount_tool_call(&server, "call_2", "read_file", r#"{"path": "f2.txt"}"#).await;
+        mount_tool_call(&server, "call_3", "read_file", r#"{"path": "f3.txt"}"#).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("finished reading", 15, 6))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: Some("You are a helper.".to_owned()),
+            prompt: "read files".to_owned(),
+            workdir: workdir.to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.output, "finished reading");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let req4: Value = serde_json::from_slice(&requests[3].body).unwrap();
+        let messages = req4.get("messages").unwrap().as_array().unwrap();
+
+        let total_chars: usize = messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .map(|s| s.chars().count())
+            .sum();
+        assert!(
+            total_chars <= 48000,
+            "total chars {total_chars} exceeds 48000"
+        );
+
+        assert_eq!(messages[1].get("role").unwrap(), "user");
+        assert_eq!(messages[1].get("content").unwrap(), "read files");
+
+        let tool1 = messages
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
+            .unwrap();
+        assert_eq!(tool1.get("role").unwrap(), "tool");
+        assert_eq!(
+            tool1.get("content").unwrap(),
+            "[earlier tool output elided to fit the context budget]"
+        );
+
+        let tool3 = messages
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_3"))
+            .unwrap();
+        assert_eq!(tool3.get("role").unwrap(), "tool");
+        let content3 = tool3.get("content").unwrap().as_str().unwrap();
+        assert!(content3.contains("1\t") && !content3.contains("elided"));
+    }
+
+    #[tokio::test]
+    async fn elision_keeps_tool_call_ids() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path();
+
+        let content = ("y".repeat(60) + "\n").repeat(300);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(workdir.join(name), &content).unwrap();
+        }
+
+        mount_tool_call(
+            &server,
+            "call_keep_id_1",
+            "read_file",
+            r#"{"path": "a.txt"}"#,
+        )
+        .await;
+        mount_tool_call(
+            &server,
+            "call_keep_id_2",
+            "read_file",
+            r#"{"path": "b.txt"}"#,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("done reading", 15, 6))
+            .mount(&server)
+            .await;
+
+        let mut prof = agent_profile(&server.uri(), 40, Permissions::WriteWorkdir);
+        prof.context_chars = 25000;
+        let backend = OpenAiBackend::from_parts(&prof, ApiKey::None).unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "read a and b".to_owned(),
+            workdir: workdir.to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let req3: Value = serde_json::from_slice(&requests[2].body).unwrap();
+        let messages = req3.get("messages").unwrap().as_array().unwrap();
+
+        let tool1 = messages
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_keep_id_1"))
+            .unwrap();
+        assert_eq!(tool1.get("role").unwrap(), "tool");
+        assert_eq!(tool1.get("tool_call_id").unwrap(), "call_keep_id_1");
+        assert_eq!(
+            tool1.get("content").unwrap(),
+            "[earlier tool output elided to fit the context budget]"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_error_when_still_too_large() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut prof = agent_profile(&server.uri(), 40, Permissions::WriteWorkdir);
+        prof.context_chars = 50;
+        let backend = OpenAiBackend::from_parts(&prof, ApiKey::None).unwrap();
+
+        let req = RunRequest {
+            system: Some("Detailed assistant instructions.".to_owned()),
+            prompt: "this task description alone is longer than 50 characters".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(
+            outcome.failure,
+            Some(FailureKind::Other(
+                "context budget exceeded after eliding tool output".to_owned()
+            ))
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
     }
 }
