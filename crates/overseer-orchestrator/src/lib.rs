@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod escalation;
+pub mod landing;
 pub mod learning;
 mod lock;
 mod recovery;
@@ -17,6 +18,7 @@ mod test_support;
 
 pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
 pub use escalation::escalation_hits;
+pub use landing::{LandOutcome, LandingError, land};
 pub use learning::{
     RetrospectError, has_learning_signal, retrospect_task, retrospect_task_with_backend,
     retrospect_task_with_backends,

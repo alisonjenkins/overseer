@@ -1077,6 +1077,7 @@ dependencies = [
  "overseer-backends",
  "overseer-core",
  "overseer-store",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
