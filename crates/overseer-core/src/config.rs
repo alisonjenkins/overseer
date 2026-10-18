@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CoreError, Permissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1500;
-const DEFAULT_MAX_STEPS: u32 = 40;
+const DEFAULT_MAX_STEPS: u32 = 100;
 
 const STARTER_TEMPLATE: &str = r#"# overseer.toml: where task worktrees come from and how tasks are run.
 #
@@ -89,7 +89,7 @@ permissions = "write-workdir"
 timeout_secs = 1500
 role_prompt = "You are a careful senior engineer."
 agent_tools = true
-max_steps = 40
+max_steps = 100
 fallback = []
 
 # Gemini through the agy CLI. Needs `agy` on PATH and signed in.
@@ -590,7 +590,7 @@ model = "local"
         assert_eq!(profile.prompt_flag, None);
         assert_eq!(profile.api_key_env, None);
         assert!(!profile.agent_tools);
-        assert_eq!(profile.max_steps, 40);
+        assert_eq!(profile.max_steps, 100);
         assert_eq!(config.repo, PathBuf::from("/work/project"));
     }
 
@@ -848,7 +848,7 @@ command = []
             Some("http://127.0.0.1:8080/v1")
         );
         assert!(local_edit.agent_tools);
-        assert_eq!(local_edit.max_steps, 40);
+        assert_eq!(local_edit.max_steps, 100);
         assert_eq!(local_edit.permissions, Permissions::WriteWorkdir);
         assert!(local_edit.fallback.is_empty());
 
