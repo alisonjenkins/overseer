@@ -80,6 +80,8 @@ mod tests {
             metered,
             permission_args: Default::default(),
             env: Default::default(),
+            agent_tools: false,
+            max_steps: 40,
         }
     }
 

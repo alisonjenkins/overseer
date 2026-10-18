@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CoreError, Permissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1500;
+const DEFAULT_MAX_STEPS: u32 = 40;
 
 const STARTER_TEMPLATE: &str = r#"# overseer.toml: where task worktrees come from and how tasks are run.
 #
@@ -147,6 +148,12 @@ pub struct Profile {
     /// backend. Values are plain strings, not secrets.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Run an agent tool loop instead of a single request (openai backend only).
+    #[serde(default)]
+    pub agent_tools: bool,
+    /// Maximum number of tool iterations before the run fails.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
 }
 
 impl Profile {
@@ -163,6 +170,10 @@ fn default_permissions() -> Permissions {
 
 fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
+}
+
+fn default_max_steps() -> u32 {
+    DEFAULT_MAX_STEPS
 }
 
 /// The whole `overseer.toml` document.
@@ -267,6 +278,12 @@ fn check_required_fields(profile: &Profile) -> Result<(), CoreError> {
             profile: profile.name.clone(),
         });
     }
+    if profile.max_steps < 1 {
+        return Err(CoreError::InvalidMaxSteps {
+            profile: profile.name.clone(),
+            max_steps: profile.max_steps,
+        });
+    }
     Ok(())
 }
 
@@ -344,7 +361,51 @@ model = "local"
         assert!(!profile.prompt_stdin);
         assert_eq!(profile.prompt_flag, None);
         assert_eq!(profile.api_key_env, None);
+        assert!(!profile.agent_tools);
+        assert_eq!(profile.max_steps, 40);
         assert_eq!(config.repo, PathBuf::from("/work/project"));
+    }
+
+    #[test]
+    fn agent_tools_and_max_steps_parse_and_default() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+agent_tools = true
+max_steps = 12
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert!(profile.agent_tools);
+        assert_eq!(profile.max_steps, 12);
+    }
+
+    #[test]
+    fn zero_max_steps_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+max_steps = 0
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::InvalidMaxSteps {
+                profile: "local".to_owned(),
+                max_steps: 0,
+            }
+        );
     }
 
     #[test]

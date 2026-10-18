@@ -53,4 +53,7 @@ pub enum CoreError {
         "profile {profile:?} has invalid env key {key:?}; keys must be non-empty and contain no '='"
     )]
     InvalidEnvKey { profile: String, key: String },
+
+    #[error("profile {profile:?} sets max_steps to {max_steps}; expected at least 1")]
+    InvalidMaxSteps { profile: String, max_steps: u32 },
 }
