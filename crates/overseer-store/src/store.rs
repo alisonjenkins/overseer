@@ -483,6 +483,7 @@ impl Store {
         })
     }
 
+    /// All reviews of a task, oldest first.
     pub fn list_reviews(&self, task_id: TaskId) -> Result<Vec<ReviewRecord>, StoreError> {
         let mut stmt = self
             .conn
