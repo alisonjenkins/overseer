@@ -1,0 +1,22 @@
+[package]
+name = "overseer-backends"
+description = "Model backends for the overseer task orchestrator"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+overseer-core = { version = "0.1.0", path = "../overseer-core" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde_json = "1.0.154"
+thiserror = "2"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "process", "rt", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
