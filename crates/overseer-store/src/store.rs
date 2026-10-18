@@ -17,14 +17,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/0003_settings.sql")),
     (4, include_str!("../migrations/0004_reviews.sql")),
     (5, include_str!("../migrations/0005_lessons.sql")),
+    (6, include_str!("../migrations/0006_reason.sql")),
 ];
 
 /// Settings key holding the `credits_low` mode flag, stored as `"true"` or
 /// `"false"`.
 const CREDITS_LOW_KEY: &str = "credits_low";
 
-const SELECT_TASK: &str =
-    "SELECT id, title, body, status, priority, profile, round, approved, created_at FROM tasks";
+const SELECT_TASK: &str = "SELECT id, title, body, status, priority, profile, round, approved, created_at, reason FROM tasks";
 
 const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
      input_tokens, output_tokens, failure, transcript_path, branch, skills FROM runs";
@@ -144,6 +144,7 @@ impl Store {
             approved: false,
             depends_on,
             created_at,
+            reason: None,
         })
     }
 
@@ -246,18 +247,27 @@ impl Store {
         Ok(task)
     }
 
-    pub fn set_status(&mut self, id: TaskId, status: TaskStatus) -> Result<(), StoreError> {
+    pub fn set_status_with_reason(
+        &mut self,
+        id: TaskId,
+        status: TaskStatus,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
         let changed = self
             .conn
             .execute(
-                "UPDATE tasks SET status = ?1 WHERE id = ?2",
-                params![status.as_str(), id.get()],
+                "UPDATE tasks SET status = ?1, reason = ?2 WHERE id = ?3",
+                params![status.as_str(), reason, id.get()],
             )
             .map_err(|source| StoreError::SetStatus { id, source })?;
         if changed == 0 {
             return Err(StoreError::UnknownTask { id });
         }
         Ok(())
+    }
+
+    pub fn set_status(&mut self, id: TaskId, status: TaskStatus) -> Result<(), StoreError> {
+        self.set_status_with_reason(id, status, None)
     }
 
     /// Atomically move a `backlog` or `blocked` task to `ready`. Any other
@@ -686,6 +696,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         .parse::<TaskStatus>()
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(err)))?;
     let approved: bool = row.get(7)?;
+    let reason: Option<String> = row.get(9)?;
     Ok(Task {
         id: TaskId::new(row.get(0)?),
         title: row.get(1)?,
@@ -697,6 +708,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         approved,
         depends_on: Vec::new(),
         created_at: row.get(8)?,
+        reason,
     })
 }
 
@@ -1734,5 +1746,56 @@ mod tests {
         assert_eq!(l.skill, "rust");
         assert_eq!(l.base_version, 3);
         assert_eq!(l.status, LessonStatus::Proposed);
+    }
+
+    #[test]
+    fn set_status_with_reason_updates_status_and_reason() {
+        let mut store = Store::open_in_memory().unwrap();
+        let task = store.add_task(new_task("escalate me", 0)).unwrap();
+        assert_eq!(task.reason, None);
+
+        store
+            .set_status_with_reason(
+                task.id,
+                TaskStatus::NeedsHuman,
+                Some("escalation: Cargo.toml"),
+            )
+            .unwrap();
+
+        let updated = store.get_task(task.id).unwrap();
+        assert_eq!(updated.status, TaskStatus::NeedsHuman);
+        assert_eq!(updated.reason.as_deref(), Some("escalation: Cargo.toml"));
+
+        // set_status clears the reason
+        store.set_status(task.id, TaskStatus::Review).unwrap();
+        let cleared = store.get_task(task.id).unwrap();
+        assert_eq!(cleared.status, TaskStatus::Review);
+        assert_eq!(cleared.reason, None);
+    }
+
+    #[test]
+    fn reason_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.db");
+        let task_id = {
+            let mut store = Store::open(&path).unwrap();
+            let task = store.add_task(new_task("persisted reason", 0)).unwrap();
+            store
+                .set_status_with_reason(
+                    task.id,
+                    TaskStatus::NeedsHuman,
+                    Some("escalation: .github/workflows/ci.yml"),
+                )
+                .unwrap();
+            task.id
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let task = reopened.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsHuman);
+        assert_eq!(
+            task.reason.as_deref(),
+            Some("escalation: .github/workflows/ci.yml")
+        );
     }
 }

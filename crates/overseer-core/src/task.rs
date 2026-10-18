@@ -44,4 +44,5 @@ pub struct Task {
     pub depends_on: Vec<TaskId>,
     /// ISO8601 UTC, e.g. `2026-10-18T08:00:00Z`.
     pub created_at: String,
+    pub reason: Option<String>,
 }
