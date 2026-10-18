@@ -82,6 +82,7 @@ mod tests {
             env: Default::default(),
             agent_tools: false,
             max_steps: 40,
+            skills: Vec::new(),
         }
     }
 
@@ -91,6 +92,7 @@ mod tests {
             default_profile: profiles[0].name.clone(),
             review: overseer_core::ReviewConfig::default(),
             profiles,
+            learning: Default::default(),
         }
     }
 

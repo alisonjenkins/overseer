@@ -363,6 +363,7 @@ mod tests {
             env: Default::default(),
             agent_tools: false,
             max_steps: 40,
+            skills: Vec::new(),
         }
     }
 
@@ -603,6 +604,7 @@ mod tests {
             env: Default::default(),
             agent_tools: true,
             max_steps,
+            skills: Vec::new(),
         }
     }
 

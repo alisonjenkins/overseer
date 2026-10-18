@@ -178,6 +178,7 @@ mod tests {
             env: Default::default(),
             agent_tools: false,
             max_steps: 40,
+            skills: Vec::new(),
         }
     }
 
@@ -187,6 +188,7 @@ mod tests {
             default_profile: default_profile.to_owned(),
             review: Default::default(),
             profiles,
+            learning: Default::default(),
         }
     }
 

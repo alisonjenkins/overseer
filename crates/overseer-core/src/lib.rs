@@ -7,7 +7,7 @@ mod run;
 mod status;
 mod task;
 
-pub use config::{BackendKind, Config, Profile, ReviewConfig};
+pub use config::{BackendKind, Config, LearningConfig, Profile, ReviewConfig, is_valid_skill_name};
 pub use permissions::Permissions;
 pub use review::{
     NewReview, ParsedReview, ReviewParseError, ReviewRecord, Verdict, parse_review, parse_verdict,
@@ -66,4 +66,13 @@ pub enum CoreError {
 
     #[error("profile {profile:?} sets max_steps to {max_steps}; expected at least 1")]
     InvalidMaxSteps { profile: String, max_steps: u32 },
+
+    #[error("profile {profile:?} references invalid skill name {skill:?}; must match [a-z0-9-]+")]
+    InvalidSkillName { profile: String, skill: String },
+
+    #[error("learning config references invalid skill name {skill:?}; must match [a-z0-9-]+")]
+    InvalidLearningSkill { skill: String },
+
+    #[error("learning profile {profile:?} does not match any profile")]
+    UnknownLearningProfile { profile: String },
 }

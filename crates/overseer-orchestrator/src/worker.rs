@@ -208,6 +208,7 @@ mod tests {
             env: Default::default(),
             agent_tools: false,
             max_steps: 40,
+            skills: Vec::new(),
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
                 fake_command_profile("succeed", "echo ok > file.txt && echo done"),
                 fake_command_profile("fail", "exit 1"),
             ],
+            learning: Default::default(),
         }
     }
 

@@ -772,6 +772,7 @@ mod tests {
             env: Default::default(),
             agent_tools: false,
             max_steps: 40,
+            skills: Vec::new(),
         }
     }
 
@@ -1009,6 +1010,7 @@ mod tests {
                 test_profile("rev1"),
                 test_profile("rev2"),
             ],
+            learning: Default::default(),
         };
 
         // First run the task to create branch & commit
@@ -1083,6 +1085,7 @@ mod tests {
                 rework_profile: None,
             },
             profiles: vec![test_profile("local"), test_profile("rev1")],
+            learning: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1124,6 +1127,7 @@ mod tests {
                 rework_profile: None,
             },
             profiles: vec![test_profile("local"), test_profile("rev1")],
+            learning: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1161,6 +1165,7 @@ mod tests {
                 rework_profile: None,
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1203,6 +1208,7 @@ mod tests {
                 rework_profile: None,
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1249,6 +1255,7 @@ mod tests {
                 rework_profile: None,
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)

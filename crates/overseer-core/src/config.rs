@@ -180,6 +180,9 @@ pub struct Profile {
     /// Maximum number of tool iterations before the run fails.
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// Skill names to inject into the system prompt.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 impl Profile {
@@ -233,6 +236,46 @@ impl Default for ReviewConfig {
     }
 }
 
+/// Configuration for task retrospectives and skill proposals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningConfig {
+    /// Profile used to run retrospectives. None means learning is disabled.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The skill proposals are written for. Defaults to "general".
+    #[serde(default = "default_learning_skill")]
+    pub skill: Option<String>,
+    /// If true, only run retrospectives on tasks that needed rework, were blocked, or escalated.
+    #[serde(default = "default_min_signal")]
+    pub min_signal: bool,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            skill: default_learning_skill(),
+            min_signal: default_min_signal(),
+        }
+    }
+}
+
+fn default_learning_skill() -> Option<String> {
+    Some("general".to_owned())
+}
+
+fn default_min_signal() -> bool {
+    true
+}
+
+/// Check if a skill name consists of non-empty ASCII lowercase letters, digits, and hyphens.
+pub fn is_valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +286,8 @@ pub struct Config {
     pub review: ReviewConfig,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub learning: LearningConfig,
 }
 
 impl Config {
@@ -286,6 +331,14 @@ impl Config {
             }
             check_required_fields(profile)?;
             check_env_keys(profile)?;
+            for skill in &profile.skills {
+                if !is_valid_skill_name(skill) {
+                    return Err(CoreError::InvalidSkillName {
+                        profile: profile.name.clone(),
+                        skill: skill.clone(),
+                    });
+                }
+            }
         }
 
         if !by_name.contains_key(self.default_profile.as_str()) {
@@ -325,6 +378,23 @@ impl Config {
         for profile in &self.profiles {
             check_fallback_cycles(profile.name.as_str(), &by_name, &mut state)?;
         }
+
+        if let Some(skill) = &self.learning.skill
+            && !is_valid_skill_name(skill)
+        {
+            return Err(CoreError::InvalidLearningSkill {
+                skill: skill.clone(),
+            });
+        }
+
+        if let Some(profile_name) = &self.learning.profile
+            && !by_name.contains_key(profile_name.as_str())
+        {
+            return Err(CoreError::UnknownLearningProfile {
+                profile: profile_name.clone(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -1045,6 +1115,140 @@ command = ["true"]
             parse_err(text),
             CoreError::UnknownReviewProfile {
                 profile: "ghost".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn skills_parse_and_default_empty() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert!(profile.skills.is_empty());
+
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+skills = ["rust", "test-driven-dev", "clean-code1"]
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert_eq!(
+            profile.skills,
+            vec!["rust", "test-driven-dev", "clean-code1"]
+        );
+    }
+
+    #[test]
+    fn invalid_skill_name_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+skills = ["Invalid_Skill"]
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::InvalidSkillName {
+                profile: "local".to_owned(),
+                skill: "Invalid_Skill".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn learning_config_defaults() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert_eq!(
+            config.learning,
+            LearningConfig {
+                profile: None,
+                skill: Some("general".to_owned()),
+                min_signal: true,
+            }
+        );
+    }
+
+    #[test]
+    fn learning_config_custom_values() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[learning]
+profile = "local"
+skill = "rust-expert"
+min_signal = false
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        assert_eq!(
+            config.learning,
+            LearningConfig {
+                profile: Some("local".to_owned()),
+                skill: Some("rust-expert".to_owned()),
+                min_signal: false,
+            }
+        );
+    }
+
+    #[test]
+    fn learning_config_rejects_unknown_profile() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[learning]
+profile = "nonexistent"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::UnknownLearningProfile {
+                profile: "nonexistent".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn learning_config_rejects_invalid_skill_name() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[learning]
+skill = "Bad Skill!"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::InvalidLearningSkill {
+                skill: "Bad Skill!".to_owned(),
             }
         );
     }
