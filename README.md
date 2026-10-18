@@ -4,9 +4,10 @@ Overseer is a single-user, local-first task orchestrator. It keeps a queue of
 software tasks in SQLite and is meant to hand them to whichever model backend
 is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
-lists the milestones. This repository currently implements M2: the task store,
-the `openai` and `command` backends, per-task worktrees, and the `overseer`
-CLI for `init`, `task`, `run` and `runs`.
+lists the milestones. This repository currently implements M3: the task store,
+the `openai` and `command` backends, per-task worktrees, fallback routing with
+credits-low mode, and the `overseer` CLI for `init`, `task`, `run`, `runs` and
+`mode`.
 
 ## Build and test
 
@@ -90,29 +91,91 @@ the last argument, or stdin when `prompt_stdin = true`. A role prompt is put
 ahead of the task text, since a plain argv has no system channel. Command
 backends report no token usage, so `run` shows zeros for them.
 
-The two examples below are **untested**. They show the shape of the profile and
-have not been run against the current CLI versions. Check each tool's flags
-before relying on it.
+A command profile's `permission_args` lists extra arguments per permission level
+(`read`, `write-workdir`, `write-shell`). They go before the prompt, for the
+level the run actually gets, which is the lower of what was asked and the
+profile's `permissions` ceiling.
 
-```toml
-# Untested example: opencode's non-interactive mode, prompt as last argument.
-[[profiles]]
-name = "opencode"
-backend = "command"
-command = ["opencode", "run"]
-permissions = "write-workdir"
-timeout_secs = 1500
+`overseer init` writes these profiles. Check each tool's flags against your
+installed version before relying on them; the test suite does not run them.
 
-# Untested example: Antigravity CLI (Gemini) in print mode. No permission flag
-# is passed yet, so the CLI may stop at its own edit approval prompt; the
-# permission mapping for `agy` is planned for M3.
-[[profiles]]
-name = "agy"
-backend = "command"
-command = ["agy", "-p"]
-permissions = "write-workdir"
-timeout_secs = 1500
+- `local`: the default profile, an `openai` server on `127.0.0.1:8080`.
+- `gemini`: `agy -p --model gemini-3.8-flash-medium`, with `agy` flags for each
+  permission level. Falls back to `local`.
+- `claude`: `claude -p`, `metered = true`, with `--permission-mode` flags.
+  Falls back to `gemini`, then `local`.
+- `opencode-local`: `opencode run`. Untested example, not in any fallback chain.
+
+The starter keeps `default_profile = "local"`. To try `claude` first, set
+`default_profile = "claude"`; the chain then covers it when it cannot run.
+
+## Routing and fallback
+
+A task's attempt plan is its profile followed by that profile's `fallback` list,
+in order. Fallbacks are followed depth-first and each profile appears once. The
+plan is fixed when `run` starts.
+
+Each attempt is its own run row with its own transcript (`overseer runs <id>`
+lists them). All attempts share the task's worktree and branch. Before each
+retry, uncommitted changes are discarded inside the worktree with
+`git checkout -- .` and `git clean -fd`, so every attempt starts from the
+branch's last commit. The main repository is never touched. On the first
+success the changes are committed and the task moves to `review`.
+
+Only some failures move on to the next profile:
+
+| Failure | Meaning | Next profile? |
+|---|---|---|
+| `quota-exhausted` | quota, rate limit or credits used up | yes |
+| `auth-required` | not signed in, or API key missing or rejected | yes |
+| `unreachable` | server down, connection or request timeout, program not found | yes |
+| `other` | anything else, including a command timeout or empty output | no, task blocked |
+
+For `openai` profiles the status code decides. For `command` profiles the
+output decides, matched case-insensitively. Auth phrases: "authentication
+required", "not logged in", "please run /login", "invalid api key",
+"unauthorized". Quota phrases: "quota", "rate limit", "usage limit", "credit
+balance is too low", "out of credits", "resource exhausted", "429", "limit
+reached". This is a heuristic: a non-zero exit whose output quotes one of these
+phrases is routed as well.
+
+If every attempt fails, the task is `blocked` and the last failure is recorded on
+its run.
+
+### Credits-low mode
+
+```sh
+overseer mode show
+overseer mode credits-low on    # or off
 ```
 
-Add a `fallback` list to a profile to name the profiles to try after it. Fallback
-routing is not active until M3, so for now each run uses only its own profile.
+The setting is stored in the database. While it is on, every profile with
+`metered = true` is left out of the plan. A metered profile that fails with
+`quota-exhausted` during a run turns credits-low on by itself and logs a
+warning. The remaining metered profiles in that task's plan are then skipped.
+
+### Exit codes
+
+`overseer run` exits `0` when the task ends in `review`, `2` when it ends
+`blocked`, and `1` on an overseer error. It prints one line per attempt.
+
+## Profile field reference
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | Unique name; referenced by tasks, `default_profile` and `fallback`. |
+| `backend` | `openai` or `command` | required | Which backend runs the profile. |
+| `model` | string | required for `openai` | Model name sent to the server. |
+| `base_url` | string | required for `openai` | Base URL, e.g. `http://127.0.0.1:8080/v1`. |
+| `api_key_env` | string | none | Name of the environment variable holding the API key. |
+| `command` | array of strings | required for `command` | argv, run in the worktree. |
+| `prompt_stdin` | bool | `false` | Send the prompt on stdin instead of as the last argument. |
+| `role_prompt` | string | none | System prompt, sent ahead of the task text. |
+| `fallback` | array of profile names | `[]` | Profiles to try, in order, after this one fails routably. |
+| `permissions` | `read`, `write-workdir` or `write-shell` | `read` | Ceiling. A run never gets more than this. |
+| `permission_args` | table: level to array of strings | `{}` | Extra argv per effective permission level, before the prompt. |
+| `metered` | bool | `false` | Spends paid credits. Skipped in credits-low mode. |
+| `timeout_secs` | integer | `1500` | Seconds before an attempt is killed. |
+
+Configs are validated on load: unknown keys, duplicate names, unknown
+`default_profile` or `fallback` names, and fallback cycles are all rejected.
