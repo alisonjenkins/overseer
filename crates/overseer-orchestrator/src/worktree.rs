@@ -57,12 +57,78 @@ pub async fn create(
     let path = worktree_path(state_dir, task_id);
     let branch = branch_name(task_id);
     let path_text = path.to_string_lossy().into_owned();
+    let head_commit = git(repo, &["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_owned());
+    let head_branch = git(repo, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_owned());
     git(
         repo,
         &["worktree", "add", "-b", &branch, &path_text, "HEAD"],
     )
     .await?;
+    if let Some(commit) = head_commit {
+        let _ = git(
+            repo,
+            &[
+                "config",
+                &format!("branch.{branch}.overseer-base-commit"),
+                &commit,
+            ],
+        )
+        .await;
+    }
+    if let Some(base_branch) = head_branch {
+        let _ = git(
+            repo,
+            &[
+                "config",
+                &format!("branch.{branch}.overseer-base"),
+                &base_branch,
+            ],
+        )
+        .await;
+    }
     Ok(Worktree { path, branch })
+}
+
+/// Unified diff between the merge base and `branch`.
+pub async fn diff(repo: &Path, branch: &str) -> Result<String, WorktreeError> {
+    diff_internal(repo, branch, false).await
+}
+
+/// Diffstat summary between the merge base and `branch`.
+pub async fn diff_stat(repo: &Path, branch: &str) -> Result<String, WorktreeError> {
+    diff_internal(repo, branch, true).await
+}
+
+async fn diff_internal(repo: &Path, branch: &str, stat: bool) -> Result<String, WorktreeError> {
+    let base = match git(repo, &["merge-base", "HEAD", branch]).await {
+        Ok(output) if !output.trim().is_empty() => output.trim().to_owned(),
+        _ => match git(
+            repo,
+            &[
+                "config",
+                "--get",
+                &format!("branch.{branch}.overseer-base-commit"),
+            ],
+        )
+        .await
+        {
+            Ok(output) if !output.trim().is_empty() => output.trim().to_owned(),
+            _ => "HEAD".to_owned(),
+        },
+    };
+    let range = format!("{base}...{branch}");
+    let mut args = vec!["diff", "--no-ext-diff"];
+    if stat {
+        args.push("--stat");
+    }
+    args.push(&range);
+    git(repo, &args).await
 }
 
 /// Stage everything in `worktree` and commit it. Returns the new commit's
@@ -259,5 +325,52 @@ mod tests {
 
         let err = create(&repo, &state, TaskId::new(5)).await.unwrap_err();
         assert!(matches!(err, WorktreeError::GitFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn diff_returns_unified_diff_against_merge_base() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(10)).await.unwrap();
+
+        std::fs::write(worktree.path.join("file.txt"), "hello from task\n").unwrap();
+        commit_all(&worktree.path, "task 10 commit").await.unwrap();
+
+        // Advance main with an independent commit
+        std::fs::write(repo.join("other.txt"), "hello from main\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "advance main"]);
+
+        let unified = diff(&repo, &worktree.branch).await.unwrap();
+        assert!(
+            unified.contains("diff --git a/file.txt b/file.txt"),
+            "{unified}"
+        );
+        assert!(unified.contains("+hello from task"), "{unified}");
+        assert!(!unified.contains("other.txt"), "{unified}");
+
+        let stat = diff_stat(&repo, &worktree.branch).await.unwrap();
+        assert!(stat.contains("file.txt"), "{stat}");
+        assert!(stat.contains("1 file changed"), "{stat}");
+        assert!(!stat.contains("other.txt"), "{stat}");
+    }
+
+    #[tokio::test]
+    async fn diff_without_changes_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(11)).await.unwrap();
+
+        let unified = diff(&repo, &worktree.branch).await.unwrap();
+        assert!(unified.trim().is_empty(), "{unified}");
+
+        let stat = diff_stat(&repo, &worktree.branch).await.unwrap();
+        assert!(stat.trim().is_empty(), "{stat}");
     }
 }
