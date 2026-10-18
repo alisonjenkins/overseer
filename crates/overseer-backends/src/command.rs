@@ -11,6 +11,9 @@ use crate::{Backend, BackendError, failed, tail};
 /// How many characters of stderr are kept in the failure message.
 const STDERR_EXCERPT_CHARS: usize = 500;
 
+/// How many characters of stderr are kept when a command exits 0 with empty stdout.
+const STDERR_EMPTY_OUTPUT_CHARS: usize = 300;
+
 /// Output phrases that mean the harness needs a fresh login or key.
 const AUTH_PHRASES: [&str; 5] = [
     "authentication required",
@@ -177,7 +180,12 @@ fn classify_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Failu
         return FailureKind::QuotaExhausted;
     }
     if exit_code == Some(0) && stdout.trim().is_empty() {
-        return FailureKind::Other("empty output".to_owned());
+        let trimmed_stderr = stderr.trim();
+        if trimmed_stderr.is_empty() {
+            return FailureKind::Other("empty output".to_owned());
+        }
+        let excerpt = tail(trimmed_stderr, STDERR_EMPTY_OUTPUT_CHARS);
+        return FailureKind::Other(format!("empty output (stderr: {excerpt})"));
     }
     let code = exit_code.map_or_else(|| "signal".to_owned(), |code| code.to_string());
     FailureKind::Other(format!(
@@ -460,6 +468,20 @@ mod tests {
             classify_failure("  \n", "", Some(0)),
             Other("empty output".to_owned())
         );
+        assert_eq!(
+            classify_failure("", "   \n\t  ", Some(0)),
+            Other("empty output".to_owned())
+        );
+        assert_eq!(
+            classify_failure("", "jetski: permission denied", Some(0)),
+            Other("empty output (stderr: jetski: permission denied)".to_owned())
+        );
+        let long_stderr = "x".repeat(350);
+        let expected_excerpt = format!("...{}", "x".repeat(300));
+        assert_eq!(
+            classify_failure("", &long_stderr, Some(0)),
+            Other(format!("empty output (stderr: {expected_excerpt})"))
+        );
     }
 
     #[tokio::test]
@@ -471,6 +493,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.failure, Some(Other("empty output".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn exit_zero_with_empty_output_and_stderr_reports_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir.path().join("fake_silent_err.sh"),
+            "echo 'jetski: permission denied' >&2\nexit 0\n",
+        );
+        let backend =
+            CommandBackend::new(&profile(&["/bin/sh", script.to_str().unwrap()], false, 10))
+                .unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.failure,
+            Some(Other(
+                "empty output (stderr: jetski: permission denied)".to_owned()
+            ))
+        );
     }
 
     #[tokio::test]
