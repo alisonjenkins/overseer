@@ -7,8 +7,8 @@ a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
 lists the milestones. This repository currently implements M4: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
 credits-low mode, the worker queue drainer with single-worker locking and crash
-recovery, and the `overseer` CLI for `init`, `task`, `run`, `runs`, `worker`,
-`status`, `mode`, `diff`, `merge` and `discard`.
+recovery, and the `overseer` CLI for `init`, `config`, `task`, `run`, `runs`, `worker`,
+`status`, `mode`, `doctor`, `diff`, `merge` and `discard`.
 
 ## Installation
 
@@ -60,6 +60,7 @@ nix develop -c cargo fmt --check
 
 ```sh
 overseer init
+overseer doctor
 overseer task add "write parser" --body "handle quotes" --priority 2 --ready
 overseer task add "write tests" --priority 1 --depends-on 1
 overseer task ready 2
@@ -220,7 +221,11 @@ RECENT RUNS
 ## Profiles
 
 Profiles live in `<state-dir>/overseer.toml`. Each task names a profile with
-`--profile`, or uses `default_profile`.
+`--profile`, or uses `default_profile`. Run `overseer config path` to print the
+path to `overseer.toml`. Run `overseer config starter [--repo PATH]` to print the
+starter configuration template to stdout without creating or requiring a state
+directory, useful for inspecting starter profiles or diffing against your current
+config.
 
 ```toml
 repo = "/home/me/src/project"
@@ -363,10 +368,58 @@ The setting is stored in the database. While it is on, every profile with
 `quota-exhausted` during a run turns credits-low on by itself and logs a
 warning. The remaining metered profiles in that task's plan are then skipped.
 
+## Checking profile health with doctor
+
+`overseer doctor [--deep]` checks which profiles can run right now, prints
+their health and meter status, shows the default profile's attempt plan, and
+reports whether any profile in that plan is usable:
+
+```sh
+overseer doctor
+overseer doctor --deep
+```
+
+```text
+PROFILE        BACKEND  HEALTH     METERED  DETAIL
+local          openai   ok         no       gpt-4o
+local-edit     openai   ok         no       gpt-4o
+gemini         command  ok         no       agy
+claude         command  ok         yes      claude
+local-agent    command  ok         no       /home/user/.claude/skills/delegation/scripts/delegate-to-local-agent.sh
+
+default plan: local
+credits-low: off
+verdict: usable
+```
+
+Each profile check runs with a 5-second timeout:
+
+- `openai`: sends a `GET {base_url}/models` request, including the API key
+  header when `api_key_env` is set. A 2xx response is `ok` and shows the first
+  model id in detail. A missing environment variable reports
+  `api key variable X is not set`. HTTP 401 and 403 report `auth required`.
+  Timeouts and connection failures report `unreachable`.
+- `command`: resolves `command[0]` after expanding a leading `~/`. An absolute
+  or relative path must exist and be executable; bare names are resolved in
+  `PATH`. If missing or not executable, doctor reports `not found: <name>`.
+  Shallow checks do not execute the program.
+- `--deep`: additionally runs each profile once in an isolated temporary directory
+  with the test prompt `Reply with the single word ok.` at `read` permission and a
+  120-second timeout. Because this consumes model quota, it is opt-in.
+
+The report annotates unhealthy profiles in the default plan, for example
+`claude(unhealthy) -> gemini -> local-agent`. When credits-low mode is on,
+metered profiles are omitted from the effective plan.
+
+The verdict is `usable` if at least one profile in the default plan is healthy,
+and `NOTHING USABLE` otherwise.
+
 ### Exit codes
 
 - `overseer run` exits `0` when the task ends in `review`, `2` when it ends
   `blocked`, and `1` on an overseer error. It prints one line per attempt.
+- `overseer doctor` exits `0` when the default attempt plan is `usable`, `2`
+  when the verdict is `NOTHING USABLE`, and `1` on an overseer error.
 - `overseer merge` and `overseer discard` exit `0` on success, `2` on refusal or
   merge conflict, and `1` on other errors.
 - `overseer worker` exits `0` on normal completion (including `--once` and
