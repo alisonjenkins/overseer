@@ -1032,8 +1032,10 @@ dependencies = [
  "assert_cmd",
  "clap",
  "overseer-core",
+ "overseer-orchestrator",
  "overseer-store",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

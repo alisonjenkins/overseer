@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use overseer_core::{Config, NewTask, Task, TaskId};
+use overseer_core::{Config, NewTask, Run, Task, TaskId};
+use overseer_orchestrator::RunSummary;
 
 use crate::cli::{Command, TaskCommand};
 use crate::state;
@@ -27,6 +28,77 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<()
             Ok(())
         }
         Command::Task(task) => run_task(&dir, task),
+        Command::Run { id } => run_one(&dir, id),
+        Command::Runs { task_id } => list_runs(&dir, task_id),
+    }
+}
+
+fn run_one(dir: &Path, id: i64) -> Result<()> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let summary = runtime
+        .block_on(overseer_orchestrator::run_task(
+            &mut store,
+            &config,
+            dir,
+            TaskId::new(id),
+        ))
+        .with_context(|| format!("failed to run task {id}"))?;
+    print_run_summary(&summary);
+    Ok(())
+}
+
+fn list_runs(dir: &Path, task_id: i64) -> Result<()> {
+    let store = state::open_existing_store(dir)?;
+    let id = TaskId::new(task_id);
+    store
+        .get_task(id)
+        .with_context(|| format!("failed to list runs of task {task_id}"))?;
+    let runs = store.list_runs(id).context("failed to list runs")?;
+    print_runs(&runs);
+    Ok(())
+}
+
+fn print_run_summary(summary: &RunSummary) {
+    println!("run: {}", summary.run_id);
+    println!("task: {} -> {}", summary.task_id, summary.status);
+    match &summary.failure {
+        None => println!("outcome: succeeded"),
+        Some(kind) => println!("outcome: failed ({kind})"),
+    }
+    println!("profile: {}", summary.profile);
+    println!("branch: {}", summary.branch);
+    println!("commit: {}", summary.commit.as_deref().unwrap_or("-"));
+    println!(
+        "tokens: input {}, output {}",
+        summary.usage.input_tokens, summary.usage.output_tokens
+    );
+    match &summary.transcript_path {
+        Some(path) => println!("transcript: {}", path.display()),
+        None => println!("transcript: -"),
+    }
+}
+
+fn print_runs(runs: &[Run]) {
+    println!(
+        "{:>5}  {:<12}  {:<10}  {:>8}  {:>8}  {:<20}  BRANCH",
+        "ID", "PROFILE", "STATUS", "INPUT", "OUTPUT", "FAILURE"
+    );
+    for run in runs {
+        println!(
+            "{:>5}  {:<12}  {:<10}  {:>8}  {:>8}  {:<20}  {}",
+            run.id,
+            run.profile,
+            run.status.as_str(),
+            run.usage.input_tokens,
+            run.usage.output_tokens,
+            run.failure.as_deref().unwrap_or("-"),
+            run.branch.as_deref().unwrap_or("-"),
+        );
     }
 }
 

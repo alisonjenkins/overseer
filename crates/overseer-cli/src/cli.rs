@@ -27,6 +27,16 @@ pub enum Command {
     /// Manage tasks.
     #[command(subcommand)]
     Task(TaskCommand),
+    /// Run a task on its profile's backend, in its own worktree and branch.
+    Run {
+        /// Id of the task to run.
+        id: i64,
+    },
+    /// List the runs of a task, oldest first.
+    Runs {
+        /// Id of the task whose runs to list.
+        task_id: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
