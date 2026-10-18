@@ -6,8 +6,8 @@ is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
 lists the milestones. This repository currently implements M3: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
-credits-low mode, and the `overseer` CLI for `init`, `task`, `run`, `runs` and
-`mode`.
+credits-low mode, and the `overseer` CLI for `init`, `task`, `run`, `runs`,
+`mode`, `diff`, `merge` and `discard`.
 
 ## Installation
 
@@ -93,6 +93,33 @@ changes stay uncommitted in the worktree, and the failure kind is recorded on
 the run. The branch and worktree are left in place for inspection.
 `overseer runs <task-id>` lists every attempt with its profile, status, token
 counts and failure.
+
+## Reviewing and landing tasks
+
+Once a task reaches `review`, you can inspect what it produced, merge it into
+your repository branch, or discard it back to the backlog.
+
+```sh
+overseer diff 1
+overseer diff 1 --stat
+overseer merge 1
+overseer discard 1
+```
+
+- `overseer diff <id> [--stat]` prints the unified diff (or `--stat` summary)
+  between the base branch tip and the task branch `overseer/task-<id>`,
+  without invoking a pager.
+- `overseer merge <id>` checks that the repository working tree is clean and
+  that HEAD is on the branch the task branched from. It runs
+  `git merge-tree --write-tree HEAD <branch>` first and returns a conflict error
+  without modifying the repository if conflicts exist. Otherwise it merges with
+  `git merge --no-ff -m "overseer: merge task <id>: <title>" <branch>`, removes
+  the task worktree, deletes the branch with `git branch -d`, sets the task
+  status to `done`, and prints the merge commit sha. Tasks may only be merged
+  from status `review`.
+- `overseer discard <id>` removes the task worktree and branch (`git branch -D`)
+  and resets the task status to `backlog`. It refuses unless the task status is
+  `review` or `blocked`.
 
 ## Profiles
 
@@ -242,8 +269,10 @@ warning. The remaining metered profiles in that task's plan are then skipped.
 
 ### Exit codes
 
-`overseer run` exits `0` when the task ends in `review`, `2` when it ends
-`blocked`, and `1` on an overseer error. It prints one line per attempt.
+- `overseer run` exits `0` when the task ends in `review`, `2` when it ends
+  `blocked`, and `1` on an overseer error. It prints one line per attempt.
+- `overseer merge` and `overseer discard` exit `0` on success, `2` on refusal or
+  merge conflict, and `1` on other errors.
 
 ## Profile field reference
 
