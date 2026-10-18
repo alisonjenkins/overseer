@@ -9,6 +9,8 @@ use crate::{Backend, BackendError, failed, tail};
 /// How many characters of an error body are kept in the failure message.
 const BODY_EXCERPT_CHARS: usize = 300;
 
+const TOOL_LOOP_SYSTEM_PROMPT: &str = "The working directory is the repository root. Use the provided tools to inspect and modify files as needed. Finish with a short summary of what you changed.";
+
 /// Where the bearer token for the server comes from.
 #[derive(Clone)]
 enum ApiKey {
@@ -29,6 +31,8 @@ pub struct OpenAiBackend {
     endpoint: String,
     model: String,
     api_key: ApiKey,
+    agent_tools: bool,
+    max_steps: u32,
 }
 
 impl OpenAiBackend {
@@ -72,6 +76,8 @@ impl OpenAiBackend {
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             model,
             api_key,
+            agent_tools: profile.agent_tools,
+            max_steps: profile.max_steps,
         })
     }
 
@@ -87,21 +93,15 @@ impl OpenAiBackend {
             "stream": false,
         })
     }
-}
 
-#[async_trait]
-impl Backend for OpenAiBackend {
-    async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .json(&self.request_body(req));
+    async fn send_chat_request(&self, body: &Value) -> Result<String, FailureKind> {
+        let mut request = self.client.post(&self.endpoint).json(body);
         match &self.api_key {
             ApiKey::None => {}
             ApiKey::Present(key) => request = request.bearer_auth(key),
             ApiKey::MissingEnv(name) => {
                 tracing::warn!(env_var = %name, "api key environment variable is not set");
-                return Ok(failed(FailureKind::AuthRequired));
+                return Err(FailureKind::AuthRequired);
             }
         }
 
@@ -109,44 +109,189 @@ impl Backend for OpenAiBackend {
             Ok(response) => response,
             Err(err) if err.is_connect() || err.is_timeout() => {
                 tracing::warn!(error = %err.without_url(), "openai endpoint unreachable");
-                return Ok(failed(FailureKind::Unreachable));
+                return Err(FailureKind::Unreachable);
             }
             Err(err) => {
-                return Ok(failed(FailureKind::Other(format!(
+                return Err(FailureKind::Other(format!(
                     "request failed: {}",
                     err.without_url()
-                ))));
+                )));
             }
         };
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Ok(failed(FailureKind::AuthRequired));
+            return Err(FailureKind::AuthRequired);
         }
         if status == reqwest::StatusCode::PAYMENT_REQUIRED
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         {
-            return Ok(failed(FailureKind::QuotaExhausted));
+            return Err(FailureKind::QuotaExhausted);
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Ok(failed(FailureKind::Other(format!(
+            return Err(FailureKind::Other(format!(
                 "status {}: {}",
                 status.as_u16(),
                 tail(&body, BODY_EXCERPT_CHARS)
-            ))));
+            )));
         }
 
-        let body = match response.text().await {
-            Ok(body) => body,
-            Err(err) => {
-                return Ok(failed(FailureKind::Other(format!(
-                    "failed to read response body: {}",
-                    err.without_url()
-                ))));
-            }
+        match response.text().await {
+            Ok(body) => Ok(body),
+            Err(err) => Err(FailureKind::Other(format!(
+                "failed to read response body: {}",
+                err.without_url()
+            ))),
+        }
+    }
+
+    async fn run_agent_loop(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+        let mut messages = Vec::new();
+        let system_content = match &req.system {
+            Some(sys) => format!("{sys}\n\n{TOOL_LOOP_SYSTEM_PROMPT}"),
+            None => TOOL_LOOP_SYSTEM_PROMPT.to_owned(),
         };
-        Ok(parse_completion(&body))
+        messages.push(json!({"role": "system", "content": system_content}));
+        messages.push(json!({"role": "user", "content": req.prompt}));
+
+        let tools = crate::tools::tool_definitions(req.permissions);
+
+        let mut steps: u32 = 0;
+        let mut total_usage = Usage::default();
+
+        loop {
+            if steps >= self.max_steps {
+                return Ok(RunOutcome {
+                    output: String::new(),
+                    usage: total_usage,
+                    failure: Some(FailureKind::Other("exceeded max_steps".to_owned())),
+                });
+            }
+            steps = steps.saturating_add(1);
+
+            let body = json!({
+                "model": self.model,
+                "messages": messages,
+                "stream": false,
+                "tools": tools,
+            });
+
+            let resp_text = match self.send_chat_request(&body).await {
+                Ok(text) => text,
+                Err(kind) => {
+                    return Ok(RunOutcome {
+                        output: String::new(),
+                        usage: total_usage,
+                        failure: Some(kind),
+                    });
+                }
+            };
+
+            let resp_val: Value = match serde_json::from_str(&resp_text) {
+                Ok(val) => val,
+                Err(_) => {
+                    return Ok(RunOutcome {
+                        output: String::new(),
+                        usage: total_usage,
+                        failure: Some(FailureKind::Other(format!(
+                            "response is not JSON: {}",
+                            tail(&resp_text, BODY_EXCERPT_CHARS)
+                        ))),
+                    });
+                }
+            };
+
+            let input_tokens = resp_val
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output_tokens = resp_val
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            total_usage.input_tokens = total_usage.input_tokens.saturating_add(input_tokens);
+            total_usage.output_tokens = total_usage.output_tokens.saturating_add(output_tokens);
+
+            let Some(choice_msg) = resp_val.pointer("/choices/0/message") else {
+                return Ok(RunOutcome {
+                    output: String::new(),
+                    usage: total_usage,
+                    failure: Some(FailureKind::Other(
+                        "response has no choices[0].message".to_owned(),
+                    )),
+                });
+            };
+
+            let tool_calls = choice_msg.get("tool_calls").and_then(Value::as_array);
+            match tool_calls {
+                Some(calls) if !calls.is_empty() => {
+                    let mut assistant_msg = choice_msg.clone();
+                    if let Some(obj) = assistant_msg.as_object_mut() {
+                        obj.remove("reasoning_content");
+                    }
+                    messages.push(assistant_msg);
+
+                    for call in calls {
+                        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                        let func_name = call
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let func_args = call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+
+                        let tool_result = crate::tools::execute_tool(
+                            &req.workdir,
+                            req.permissions,
+                            func_name,
+                            func_args,
+                        )
+                        .await;
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": tool_result,
+                        }));
+                    }
+                }
+                _ => {
+                    let Some(content) = choice_msg.get("content").and_then(Value::as_str) else {
+                        return Ok(RunOutcome {
+                            output: String::new(),
+                            usage: total_usage,
+                            failure: Some(FailureKind::Other(
+                                "response has no choices[0].message.content".to_owned(),
+                            )),
+                        });
+                    };
+                    return Ok(RunOutcome {
+                        output: content.to_owned(),
+                        usage: total_usage,
+                        failure: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for OpenAiBackend {
+    async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+        if !self.agent_tools {
+            let body = self.request_body(req);
+            let resp_text = match self.send_chat_request(&body).await {
+                Ok(text) => text,
+                Err(kind) => return Ok(failed(kind)),
+            };
+            return Ok(parse_completion(&resp_text));
+        }
+
+        self.run_agent_loop(req).await
     }
 }
 
@@ -432,5 +577,459 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    fn agent_profile(base_url: &str, max_steps: u32, permissions: Permissions) -> Profile {
+        let base = if base_url.ends_with("/v1") {
+            base_url.to_owned()
+        } else {
+            format!("{base_url}/v1")
+        };
+        Profile {
+            name: "local-agent".to_owned(),
+            backend: BackendKind::Openai,
+            model: Some("local".to_owned()),
+            base_url: Some(base),
+            api_key_env: None,
+            command: None,
+            prompt_flag: None,
+            prompt_stdin: false,
+            role_prompt: None,
+            fallback: Vec::new(),
+            permissions,
+            timeout_secs: 5,
+            metered: false,
+            permission_args: Default::default(),
+            env: Default::default(),
+            agent_tools: true,
+            max_steps,
+        }
+    }
+
+    fn tool_call_completion(
+        id: &str,
+        name: &str,
+        arguments: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens
+            }
+        }))
+    }
+
+    fn final_completion(
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                }
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn tool_loop_write_file_then_final_answer() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_1",
+                "write_file",
+                r#"{"path": "hello.txt", "content": "world"}"#,
+                10,
+                5,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("created hello.txt", 15, 6))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: Some("You are a helper.".to_owned()),
+            prompt: "write hello.txt".to_owned(),
+            workdir: workdir.to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.output, "created hello.txt");
+        assert_eq!(outcome.usage.input_tokens, 25);
+        assert_eq!(outcome.usage.output_tokens, 11);
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("hello.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_loop_path_escape_returns_error_tool_message_and_continues() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_esc",
+                "write_file",
+                r#"{"path": "../escape.txt", "content": "evil"}"#,
+                10,
+                5,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("recovered from error", 20, 8))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "try escape".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.output, "recovered from error");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let Some(second) = requests.get(1) else {
+            panic!("expected second request");
+        };
+        let req2: Value = serde_json::from_slice(&second.body).unwrap();
+        let tool_msg = req2
+            .pointer("/messages/3")
+            .expect("should have tool message at index 3");
+        assert_eq!(tool_msg.get("role").unwrap(), "tool");
+        assert_eq!(tool_msg.get("tool_call_id").unwrap(), "call_esc");
+        let content = tool_msg.get("content").unwrap().as_str().unwrap();
+        assert!(content.starts_with("error:"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_unknown_tool_returns_error_and_continues() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_unk",
+                "nonexistent_tool",
+                "{}",
+                10,
+                5,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("handled unknown tool", 15, 6))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "do something".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.output, "handled unknown tool");
+
+        let requests = server.received_requests().await.unwrap();
+        let Some(second) = requests.get(1) else {
+            panic!("expected second request");
+        };
+        let req2: Value = serde_json::from_slice(&second.body).unwrap();
+        let tool_msg = req2
+            .pointer("/messages/3")
+            .expect("should have tool message at index 3");
+        assert_eq!(tool_msg.get("role").unwrap(), "tool");
+        let content = tool_msg.get("content").unwrap().as_str().unwrap();
+        assert!(content.starts_with("error: unknown tool"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_bad_json_args_returns_error_and_continues() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_bad",
+                "write_file",
+                "{broken json",
+                10,
+                5,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("handled bad json", 15, 6))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "bad json test".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.output, "handled bad json");
+
+        let requests = server.received_requests().await.unwrap();
+        let Some(second) = requests.get(1) else {
+            panic!("expected second request");
+        };
+        let req2: Value = serde_json::from_slice(&second.body).unwrap();
+        let tool_msg = req2
+            .pointer("/messages/3")
+            .expect("should have tool message at index 3");
+        assert_eq!(tool_msg.get("role").unwrap(), "tool");
+        let content = tool_msg.get("content").unwrap().as_str().unwrap();
+        assert!(content.starts_with("error: invalid arguments"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_read_only_permission_hides_write_tools() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("read only answer", 10, 5))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::Read),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "inspect repo".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::Read,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.output, "read only answer");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let Some(first) = requests.first() else {
+            panic!("expected request");
+        };
+        let req1: Value = serde_json::from_slice(&first.body).unwrap();
+        let tools = req1.get("tools").unwrap().as_array().unwrap();
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tool_names, ["list_dir", "read_file"]);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_max_steps_exceeded_fails() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_loop",
+                "list_dir",
+                r#"{"path": "."}"#,
+                10,
+                5,
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 2, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "infinite loop".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(
+            outcome.failure,
+            Some(FailureKind::Other("exceeded max_steps".to_owned()))
+        );
+        assert_eq!(outcome.usage.input_tokens, 20);
+        assert_eq!(outcome.usage.output_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_usage_summed_across_steps() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_step1",
+                "list_dir",
+                r#"{"path": "."}"#,
+                100,
+                25,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(final_completion("finished", 150, 40))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "check usage".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.usage.input_tokens, 250);
+        assert_eq!(outcome.usage.output_tokens, 65);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_http_429_mid_loop_classified_quota_exhausted() {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(tool_call_completion(
+                "call_1",
+                "list_dir",
+                r#"{"path": "."}"#,
+                50,
+                10,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limit reached"))
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiBackend::from_parts(
+            &agent_profile(&server.uri(), 40, Permissions::WriteWorkdir),
+            ApiKey::None,
+        )
+        .unwrap();
+
+        let req = RunRequest {
+            system: None,
+            prompt: "rate limit mid loop".to_owned(),
+            workdir: temp.path().to_path_buf(),
+            permissions: Permissions::WriteWorkdir,
+        };
+
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(outcome.failure, Some(FailureKind::QuotaExhausted));
+        assert_eq!(outcome.usage.input_tokens, 50);
+        assert_eq!(outcome.usage.output_tokens, 10);
     }
 }
