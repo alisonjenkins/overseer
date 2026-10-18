@@ -143,4 +143,16 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("failed to count tasks by status")]
+    TaskCounts {
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to list recent runs")]
+    ListRecentRuns {
+        #[source]
+        source: rusqlite::Error,
+    },
 }

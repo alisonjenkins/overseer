@@ -3,7 +3,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use overseer_core::{Config, NewTask, Run, Task, TaskId, TaskStatus};
-use overseer_orchestrator::RunSummary;
+use overseer_orchestrator::{
+    RunSummary, ShutdownSignal, WorkerError, WorkerLockError, WorkerOptions, check_worker_status,
+};
 
 use crate::cli::{Command, ModeCommand, Switch, TaskCommand};
 use crate::state;
@@ -43,6 +45,9 @@ impl From<anyhow::Error> for CliError {
     }
 }
 
+/// Exit code when another worker holds the lock.
+const EXIT_LOCKED: u8 = 3;
+
 pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<ExitCode, CliError> {
     let dir = state::resolve_state_dir(state_dir)?;
     match command {
@@ -75,6 +80,15 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         Command::Diff { id, stat } => run_diff(&dir, id, stat),
         Command::Merge { id } => run_merge(&dir, id),
         Command::Discard { id } => run_discard(&dir, id),
+        Command::Worker {
+            once,
+            max_tasks,
+            poll_secs,
+        } => run_worker_cmd(&dir, once, max_tasks, poll_secs).map_err(CliError::from),
+        Command::Status => {
+            run_status(&dir)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Mode(mode) => {
             run_mode(&dir, mode)?;
             Ok(ExitCode::SUCCESS)
@@ -384,4 +398,121 @@ fn print_task(task: &Task) {
         println!();
         println!("{}", task.body);
     }
+}
+
+fn run_worker_cmd(
+    dir: &Path,
+    once: bool,
+    max_tasks: Option<usize>,
+    poll_secs: u64,
+) -> Result<ExitCode> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_signal = ShutdownSignal::new(shutdown_rx);
+
+    runtime.spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+        println!("stopping after current task");
+        let _ = shutdown_tx.send(true);
+
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+        std::process::exit(130);
+    });
+
+    let options = WorkerOptions {
+        once,
+        max_tasks,
+        poll_interval: std::time::Duration::from_secs(poll_secs),
+    };
+
+    let result = runtime.block_on(overseer_orchestrator::run_worker(
+        &mut store,
+        &config,
+        dir,
+        options,
+        shutdown_signal,
+    ));
+
+    match result {
+        Ok(_) => Ok(ExitCode::SUCCESS),
+        Err(WorkerError::Lock(WorkerLockError::AlreadyLocked { pid })) => {
+            let pid_msg = match pid {
+                Some(p) => format!(" (pid {p})"),
+                None => String::new(),
+            };
+            eprintln!("overseer: another worker is already running{pid_msg}");
+            Ok(ExitCode::from(EXIT_LOCKED))
+        }
+        Err(err) => bail!("worker failed: {err}"),
+    }
+}
+
+fn run_status(dir: &Path) -> Result<()> {
+    let store = state::open_existing_store(dir)?;
+
+    let worker_pid = check_worker_status(dir).context("failed to inspect worker status")?;
+    match worker_pid {
+        Some(pid) => println!("worker: running (pid {pid})"),
+        None => println!("worker: not running"),
+    }
+
+    let credits_low = store
+        .credits_low()
+        .context("failed to read credits-low mode")?;
+    println!("credits-low: {}", if credits_low { "on" } else { "off" });
+
+    println!();
+    println!("TASKS");
+    println!("{:<12}  {:>5}", "STATUS", "COUNT");
+    let counts = store
+        .task_counts_by_status()
+        .context("failed to count tasks")?;
+    for (status, count) in counts {
+        println!("{:<12}  {:>5}", status.as_str(), count);
+    }
+
+    println!();
+    println!("RECENT RUNS");
+    println!(
+        "{:>5}  {:>5}  {:<12}  {:<10}  {:>12}",
+        "ID", "TASK", "PROFILE", "STATUS", "TOKENS"
+    );
+    let runs = store
+        .list_recent_runs(5)
+        .context("failed to list recent runs")?;
+    for run in runs {
+        let tokens = format!("{}/{}", run.usage.input_tokens, run.usage.output_tokens);
+        println!(
+            "{:>5}  {:>5}  {:<12}  {:<10}  {:>12}",
+            run.id,
+            run.task_id,
+            run.profile,
+            run.status.as_str(),
+            tokens
+        );
+    }
+
+    Ok(())
 }

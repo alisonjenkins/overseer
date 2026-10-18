@@ -175,6 +175,45 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Returns the counts of tasks grouped by status for all task statuses.
+    pub fn task_counts_by_status(&self) -> Result<Vec<(TaskStatus, usize)>, StoreError> {
+        let mut counts = std::collections::HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+            .map_err(|source| StoreError::TaskCounts { source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let status_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((status_str, count))
+            })
+            .map_err(|source| StoreError::TaskCounts { source })?;
+
+        for row in rows {
+            let (status_str, count) = row.map_err(|source| StoreError::TaskCounts { source })?;
+            if let Ok(status) = status_str.parse::<TaskStatus>() {
+                let count_usize = usize::try_from(count.max(0)).unwrap_or(0);
+                let _ = counts.insert(status, count_usize);
+            }
+        }
+
+        let all_statuses = [
+            TaskStatus::Backlog,
+            TaskStatus::Ready,
+            TaskStatus::Running,
+            TaskStatus::Review,
+            TaskStatus::Blocked,
+            TaskStatus::NeedsHuman,
+            TaskStatus::Done,
+        ];
+
+        Ok(all_statuses
+            .iter()
+            .map(|&status| (status, counts.get(&status).copied().unwrap_or(0)))
+            .collect())
+    }
+
     /// Pick the highest-priority eligible ready task whose dependencies are
     /// all `done`. Among ties, the lowest id is chosen. Tasks with unmet
     /// dependencies are skipped.
@@ -314,6 +353,20 @@ impl Store {
             .query_map(params![task_id.get()], run_from_row)
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Run>>>())
             .map_err(list_err)?;
+        Ok(runs)
+    }
+
+    /// Return the newest runs up to `limit`, newest first.
+    pub fn list_recent_runs(&self, limit: usize) -> Result<Vec<Run>, StoreError> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SELECT_RUN} ORDER BY id DESC LIMIT ?1"))
+            .map_err(|source| StoreError::ListRecentRuns { source })?;
+        let runs = stmt
+            .query_map(params![limit_i64], run_from_row)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Run>>>())
+            .map_err(|source| StoreError::ListRecentRuns { source })?;
         Ok(runs)
     }
 
@@ -1066,5 +1119,43 @@ mod tests {
         store.set_status(t_p10.id, TaskStatus::Done).unwrap();
         // t_p1_blocked still has unmet dep
         assert_eq!(store.pick_next_ready_task().unwrap(), None);
+    }
+
+    #[test]
+    fn task_counts_by_status_reports_all_statuses() {
+        let mut store = memory_store();
+        let t1 = store.add_task(new_task("t1", 0)).unwrap();
+        let _t2 = store.add_task(new_task("t2", 0)).unwrap();
+        store.set_status(t1.id, TaskStatus::Ready).unwrap();
+
+        let counts = store.task_counts_by_status().unwrap();
+        let map: std::collections::HashMap<_, _> = counts.into_iter().collect();
+        assert_eq!(map.get(&TaskStatus::Backlog), Some(&1));
+        assert_eq!(map.get(&TaskStatus::Ready), Some(&1));
+        assert_eq!(map.get(&TaskStatus::Running), Some(&0));
+        assert_eq!(map.get(&TaskStatus::Review), Some(&0));
+        assert_eq!(map.get(&TaskStatus::Blocked), Some(&0));
+        assert_eq!(map.get(&TaskStatus::NeedsHuman), Some(&0));
+        assert_eq!(map.get(&TaskStatus::Done), Some(&0));
+    }
+
+    #[test]
+    fn list_recent_runs_orders_newest_first_and_limits() {
+        let mut store = memory_store();
+        let t = store.add_task(new_task("t", 0)).unwrap();
+        let r1 = store.start_run(t.id, "local").unwrap();
+        let r2 = store.start_run(t.id, "local").unwrap();
+        let r3 = store.start_run(t.id, "local").unwrap();
+
+        let recent = store.list_recent_runs(2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, r3);
+        assert_eq!(recent[1].id, r2);
+
+        let all = store.list_recent_runs(10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, r3);
+        assert_eq!(all[1].id, r2);
+        assert_eq!(all[2].id, r1);
     }
 }

@@ -377,3 +377,100 @@ async fn init_writes_the_routing_profiles_with_comments() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn worker_command_drains_queue_and_status_reports_correctly() {
+    let fx = setup();
+    stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
+    let agy = fake_agy(fx._root.path());
+    write_config(
+        &fx.state,
+        &format!(
+            r#"repo = "{repo}"
+default_profile = "gemini"
+
+[[profiles]]
+name = "gemini"
+backend = "command"
+command = ["{agy}"]
+permissions = "write-workdir"
+"#,
+            repo = fx.repo.display(),
+            agy = agy.display(),
+        ),
+    );
+
+    stdout_of(&fx.state, &["task", "add", "parser task", "--ready"]);
+    stdout_of(&fx.state, &["task", "add", "unready task"]);
+
+    // Status before worker runs
+    let status_pre = stdout_of(&fx.state, &["status"]);
+    assert!(status_pre.contains("worker: not running"), "{status_pre}");
+    assert!(status_pre.contains("credits-low: off"), "{status_pre}");
+    assert!(
+        status_pre
+            .lines()
+            .any(|l| l.starts_with("ready") && l.ends_with('1')),
+        "{status_pre}"
+    );
+    assert!(
+        status_pre
+            .lines()
+            .any(|l| l.starts_with("backlog") && l.ends_with('1')),
+        "{status_pre}"
+    );
+
+    // Run worker --once
+    let worker_out = stdout_of(&fx.state, &["worker", "--once"]);
+    assert!(
+        worker_out.contains("task 1 parser task: review (gemini, 1 attempt(s))"),
+        "{worker_out}"
+    );
+
+    // Status after worker runs
+    let status_post = stdout_of(&fx.state, &["status"]);
+    assert!(status_post.contains("worker: not running"), "{status_post}");
+    assert!(
+        status_post
+            .lines()
+            .any(|l| l.starts_with("review") && l.ends_with('1')),
+        "{status_post}"
+    );
+    assert!(
+        status_post
+            .lines()
+            .any(|l| l.starts_with("backlog") && l.ends_with('1')),
+        "{status_post}"
+    );
+    assert!(status_post.contains("gemini"), "{status_post}");
+}
+
+#[tokio::test]
+async fn worker_command_locked_exits_code_3() {
+    let fx = setup();
+    stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
+
+    let _lock = overseer_orchestrator::WorkerLock::acquire(&fx.state).unwrap();
+
+    let output = overseer(&fx.state)
+        .arg("worker")
+        .arg("--once")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("another worker is already running"),
+        "{stderr}"
+    );
+
+    // Status shows worker is running
+    let status = stdout_of(&fx.state, &["status"]);
+    assert!(
+        status.contains(&format!("worker: running (pid {})", std::process::id())),
+        "{status}"
+    );
+}

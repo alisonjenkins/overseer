@@ -55,6 +55,20 @@ pub enum Command {
         /// Id of the task to discard.
         id: i64,
     },
+    /// Drain the ready task queue.
+    Worker {
+        /// Exit immediately if no ready tasks are eligible.
+        #[arg(long)]
+        once: bool,
+        /// Maximum number of tasks to run before stopping.
+        #[arg(long, value_name = "N")]
+        max_tasks: Option<usize>,
+        /// Seconds to wait before polling for new tasks when idle.
+        #[arg(long, default_value_t = 5, value_name = "SECS")]
+        poll_secs: u64,
+    },
+    /// Print status of the task queue, worker, and recent runs.
+    Status,
     /// Show or change the routing mode.
     #[command(subcommand)]
     Mode(ModeCommand),
