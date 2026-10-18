@@ -8,7 +8,10 @@ mod run;
 mod status;
 mod task;
 
-pub use config::{BackendKind, Config, LearningConfig, Profile, ReviewConfig, is_valid_skill_name};
+pub use config::{
+    BackendKind, Config, EscalationConfig, LearningConfig, Profile, ReviewConfig,
+    is_valid_skill_name,
+};
 pub use lesson::{Lesson, LessonId, LessonStatus, NewLesson};
 pub use permissions::Permissions;
 pub use review::{
@@ -77,4 +80,7 @@ pub enum CoreError {
 
     #[error("learning profile {profile:?} does not match any profile")]
     UnknownLearningProfile { profile: String },
+
+    #[error("escalation path glob {glob:?} is invalid: {message}")]
+    InvalidEscalationGlob { glob: String, message: String },
 }

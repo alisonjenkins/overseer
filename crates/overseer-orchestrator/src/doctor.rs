@@ -187,6 +187,7 @@ mod tests {
             repo: "/work/project".into(),
             default_profile: default_profile.to_owned(),
             review: Default::default(),
+            escalation: Default::default(),
             profiles,
             learning: Default::default(),
         }

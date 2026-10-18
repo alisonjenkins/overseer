@@ -91,6 +91,7 @@ mod tests {
             repo: "/work/project".into(),
             default_profile: profiles[0].name.clone(),
             review: overseer_core::ReviewConfig::default(),
+            escalation: Default::default(),
             profiles,
             learning: Default::default(),
         }

@@ -418,6 +418,7 @@ mod tests {
                 min_signal: true,
             },
             review: Default::default(),
+            escalation: Default::default(),
         }
     }
 

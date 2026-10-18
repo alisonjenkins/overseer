@@ -35,6 +35,29 @@ default_profile = "local"
 # max_reworks = 2
 # rework_profile = "local-edit"  # defaults to the task's own profile
 
+# Hard escalation rules. Tasks whose diff touches any of these patterns will
+# pause at needs-human before review, requiring human approval.
+#
+# [escalation]
+# enabled = true
+# paths = [
+#     ".github/**",
+#     ".gitlab-ci.yml",
+#     "**/migrations/**",
+#     "**/auth/**",
+#     "**/*.tf",
+#     "Dockerfile*",
+#     "**/Dockerfile*",
+#     "deploy/**",
+#     "Cargo.toml",
+#     "**/Cargo.toml",
+#     "package.json",
+#     "**/package.json",
+#     "flake.nix",
+#     ".env*",
+#     "**/secrets/**",
+# ]
+
 # A llama.cpp-style server on this machine. An openai backend returns text only
 # and cannot edit files.
 [[profiles]]
@@ -276,6 +299,55 @@ pub fn is_valid_skill_name(name: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
+
+pub const DEFAULT_ESCALATION_PATHS: &[&str] = &[
+    ".github/**",
+    ".gitlab-ci.yml",
+    "**/migrations/**",
+    "**/auth/**",
+    "**/*.tf",
+    "Dockerfile*",
+    "**/Dockerfile*",
+    "deploy/**",
+    "Cargo.toml",
+    "**/Cargo.toml",
+    "package.json",
+    "**/package.json",
+    "flake.nix",
+    ".env*",
+    "**/secrets/**",
+];
+
+fn default_escalation_enabled() -> bool {
+    true
+}
+
+fn default_escalation_paths() -> Vec<String> {
+    DEFAULT_ESCALATION_PATHS
+        .iter()
+        .map(|&s| s.to_owned())
+        .collect()
+}
+
+/// Configuration for hard escalation on sensitive changed paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EscalationConfig {
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_escalation_paths")]
+    pub paths: Vec<String>,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            paths: default_escalation_paths(),
+        }
+    }
+}
+
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +356,8 @@ pub struct Config {
     pub default_profile: String,
     #[serde(default)]
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub escalation: EscalationConfig,
     #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
@@ -393,6 +467,15 @@ impl Config {
             return Err(CoreError::UnknownLearningProfile {
                 profile: profile_name.clone(),
             });
+        }
+
+        for pattern in &self.escalation.paths {
+            if let Err(err) = globset::Glob::new(pattern) {
+                return Err(CoreError::InvalidEscalationGlob {
+                    glob: pattern.clone(),
+                    message: err.to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -1251,5 +1334,73 @@ model = "local"
                 skill: "Bad Skill!".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn escalation_config_defaults_when_omitted() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert!(config.escalation.enabled);
+        assert_eq!(
+            config.escalation.paths,
+            vec![
+                ".github/**",
+                ".gitlab-ci.yml",
+                "**/migrations/**",
+                "**/auth/**",
+                "**/*.tf",
+                "Dockerfile*",
+                "**/Dockerfile*",
+                "deploy/**",
+                "Cargo.toml",
+                "**/Cargo.toml",
+                "package.json",
+                "**/package.json",
+                "flake.nix",
+                ".env*",
+                "**/secrets/**",
+            ]
+        );
+    }
+
+    #[test]
+    fn escalation_config_parses_custom_values() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[escalation]
+enabled = false
+paths = ["custom/**", "secret.key"]
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        assert!(!config.escalation.enabled);
+        assert_eq!(config.escalation.paths, vec!["custom/**", "secret.key"]);
+    }
+
+    #[test]
+    fn escalation_config_rejects_invalid_glob() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "local"
+
+[escalation]
+paths = ["[a-"]
+
+[[profiles]]
+name = "local"
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local"
+"#;
+        assert!(matches!(
+            parse_err(text),
+            CoreError::InvalidEscalationGlob { ref glob, .. } if glob == "[a-"
+        ));
     }
 }

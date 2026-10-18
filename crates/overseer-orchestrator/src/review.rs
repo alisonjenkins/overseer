@@ -1018,6 +1018,7 @@ mod tests {
                 test_profile("rev2"),
             ],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         // First run the task to create branch & commit
@@ -1093,6 +1094,7 @@ mod tests {
             },
             profiles: vec![test_profile("local"), test_profile("rev1")],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1135,6 +1137,7 @@ mod tests {
             },
             profiles: vec![test_profile("local"), test_profile("rev1")],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1173,6 +1176,7 @@ mod tests {
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1216,6 +1220,7 @@ mod tests {
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1263,6 +1268,7 @@ mod tests {
             },
             profiles: vec![test_profile("local"), test_profile("rev")],
             learning: Default::default(),
+            escalation: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
