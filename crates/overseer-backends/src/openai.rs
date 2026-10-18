@@ -207,6 +207,7 @@ mod tests {
             base_url: Some(base_url.to_owned()),
             api_key_env: None,
             command: None,
+            prompt_flag: None,
             prompt_stdin: false,
             role_prompt: None,
             fallback: Vec::new(),

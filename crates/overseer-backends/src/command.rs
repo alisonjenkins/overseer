@@ -201,6 +201,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             command: Some(argv.iter().map(|arg| (*arg).to_owned()).collect()),
+            prompt_flag: None,
             prompt_stdin,
             role_prompt: None,
             fallback: Vec::new(),

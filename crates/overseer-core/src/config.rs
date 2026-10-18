@@ -115,6 +115,11 @@ pub struct Profile {
     /// argument unless `prompt_stdin` is set.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Flag placed immediately before the prompt argument for a `command`
+    /// backend, such as `"-p"`. Appended together with the prompt as the
+    /// final two arguments. Mutually exclusive with `prompt_stdin`.
+    #[serde(default)]
+    pub prompt_flag: Option<String>,
     #[serde(default)]
     pub prompt_stdin: bool,
     #[serde(default)]
@@ -250,6 +255,11 @@ fn check_required_fields(profile: &Profile) -> Result<(), CoreError> {
             _ => return Err(missing("command")),
         },
     }
+    if profile.prompt_stdin && profile.prompt_flag.is_some() {
+        return Err(CoreError::PromptFlagWithStdin {
+            profile: profile.name.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -313,6 +323,7 @@ model = "local"
         assert_eq!(profile.timeout_secs, 1500);
         assert!(profile.fallback.is_empty());
         assert!(!profile.prompt_stdin);
+        assert_eq!(profile.prompt_flag, None);
         assert_eq!(profile.api_key_env, None);
         assert_eq!(config.repo, PathBuf::from("/work/project"));
     }
@@ -339,8 +350,49 @@ timeout_secs = 60
             Some(&["opencode".to_owned(), "run".to_owned()][..])
         );
         assert!(profile.prompt_stdin);
+        assert_eq!(profile.prompt_flag, None);
         assert_eq!(profile.permissions, Permissions::WriteWorkdir);
         assert_eq!(profile.timeout_secs, 60);
+    }
+
+    #[test]
+    fn command_profile_parses_prompt_flag() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["agy", "--model", "gemini-3.8-flash-medium"]
+prompt_flag = "-p"
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("agent").unwrap();
+        assert_eq!(profile.backend, BackendKind::Command);
+        assert_eq!(profile.prompt_flag.as_deref(), Some("-p"));
+        assert!(!profile.prompt_stdin);
+    }
+
+    #[test]
+    fn prompt_flag_together_with_prompt_stdin_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["tool"]
+prompt_flag = "-p"
+prompt_stdin = true
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::PromptFlagWithStdin {
+                profile: "agent".to_owned()
+            }
+        );
     }
 
     #[test]

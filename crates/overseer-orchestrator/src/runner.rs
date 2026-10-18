@@ -513,6 +513,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:1/v1".to_owned()),
             api_key_env: None,
             command: None,
+            prompt_flag: None,
             prompt_stdin: false,
             role_prompt: Some("You are careful.".to_owned()),
             fallback: Vec::new(),

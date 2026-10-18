@@ -71,6 +71,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             command: Some(vec!["true".to_owned()]),
+            prompt_flag: None,
             prompt_stdin: false,
             role_prompt: None,
             fallback: fallback.iter().map(|name| (*name).to_owned()).collect(),

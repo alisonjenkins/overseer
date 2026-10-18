@@ -45,4 +45,7 @@ pub enum CoreError {
 
     #[error("fallback list of profile {profile:?} forms a cycle")]
     FallbackCycle { profile: String },
+
+    #[error("profile {profile:?} sets prompt_flag together with prompt_stdin = true")]
+    PromptFlagWithStdin { profile: String },
 }
