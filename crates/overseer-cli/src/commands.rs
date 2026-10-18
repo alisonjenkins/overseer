@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use overseer_core::{Config, NewTask, Task, TaskId};
 
 use crate::cli::{Command, TaskCommand};
@@ -38,13 +38,23 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
             body,
             priority,
             depends_on,
+            profile,
         } => {
+            if let Some(name) = profile.as_deref() {
+                let config = state::load_config(dir)?;
+                if config.profile(name).is_none() {
+                    bail!(
+                        "profile {name:?} is not defined in {}",
+                        state::config_path(dir).display()
+                    );
+                }
+            }
             let task = store
                 .add_task(NewTask {
                     title,
                     body,
                     priority,
-                    profile: None,
+                    profile,
                     depends_on: depends_on.into_iter().map(TaskId::new).collect(),
                 })
                 .context("failed to add task")?;

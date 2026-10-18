@@ -42,6 +42,10 @@ pub enum TaskCommand {
         /// Id of a task that must finish first; repeat for several.
         #[arg(long = "depends-on", value_name = "ID")]
         depends_on: Vec<i64>,
+        /// Profile from overseer.toml to run this task on. Defaults to the
+        /// config's default_profile.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
     },
     /// List tasks, most urgent first.
     List {

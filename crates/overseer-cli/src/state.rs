@@ -72,6 +72,17 @@ pub fn write_starter_config(state_dir: &Path, config: &Config) -> Result<bool> {
     Ok(true)
 }
 
+pub fn load_config(state_dir: &Path) -> Result<Config> {
+    let path = config_path(state_dir);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no overseer config at {}; run `overseer init` first",
+            path.display()
+        )
+    })?;
+    Config::from_toml_str(&text).with_context(|| format!("invalid config {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -115,5 +126,15 @@ mod tests {
         assert!(!write_starter_config(dir.path(), &config).unwrap());
         let kept = std::fs::read_to_string(config_path(dir.path())).unwrap();
         assert_eq!(kept, "# edited by hand\n");
+    }
+
+    #[test]
+    fn load_config_explains_how_to_fix_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("run `overseer init` first"),
+            "{err:#}"
+        );
     }
 }
