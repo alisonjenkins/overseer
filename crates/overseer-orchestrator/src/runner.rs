@@ -531,6 +531,7 @@ mod tests {
         Config {
             repo: repo.to_path_buf(),
             default_profile: "local".to_owned(),
+            review: overseer_core::ReviewConfig::default(),
             profiles: vec![profile("local"), profile("alt")],
         }
     }
@@ -763,6 +764,7 @@ mod tests {
         Config {
             repo: repo.to_path_buf(),
             default_profile: profiles[0].name.clone(),
+            review: overseer_core::ReviewConfig::default(),
             profiles,
         }
     }

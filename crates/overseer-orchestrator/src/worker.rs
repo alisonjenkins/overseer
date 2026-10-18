@@ -206,6 +206,7 @@ mod tests {
         Config {
             repo: repo.to_path_buf(),
             default_profile: "succeed".to_owned(),
+            review: overseer_core::ReviewConfig::default(),
             profiles: vec![
                 fake_command_profile("succeed", "echo ok > file.txt && echo done"),
                 fake_command_profile("fail", "exit 1"),

@@ -2,12 +2,14 @@
 
 mod config;
 mod permissions;
+mod review;
 mod run;
 mod status;
 mod task;
 
-pub use config::{BackendKind, Config, Profile};
+pub use config::{BackendKind, Config, Profile, ReviewConfig};
 pub use permissions::Permissions;
+pub use review::{ParsedReview, ReviewParseError, Verdict, parse_review, parse_verdict};
 pub use run::{FailureKind, Run, RunFinish, RunId, RunOutcome, RunRequest, RunStatus, Usage};
 pub use status::TaskStatus;
 pub use task::{NewTask, Task, TaskId};
@@ -21,6 +23,9 @@ pub enum CoreError {
 
     #[error("unknown permission level {value:?}; expected read, write-workdir or write-shell")]
     UnknownPermissions { value: String },
+
+    #[error("unknown review verdict {value:?}; expected PASS, CHANGES or ESCALATE")]
+    UnknownVerdict { value: String },
 
     #[error("failed to parse overseer.toml: {message}")]
     ConfigParse { message: String },
@@ -42,6 +47,9 @@ pub enum CoreError {
 
     #[error("profile {profile:?} falls back to {fallback:?}, which is not a profile")]
     UnknownFallback { profile: String, fallback: String },
+
+    #[error("review profile {profile:?} does not match any profile")]
+    UnknownReviewProfile { profile: String },
 
     #[error("fallback list of profile {profile:?} forms a cycle")]
     FallbackCycle { profile: String },

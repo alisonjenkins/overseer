@@ -24,6 +24,17 @@ repo = {repo}
 # Profile for tasks that do not name one with --profile.
 default_profile = "local"
 
+# Optional review and rework loop. When profiles is non-empty, every task
+# that finishes running is reviewed by each listed profile concurrently.
+# If any reviewer asks for changes, the task is reworked up to max_reworks
+# times. If any reviewer escalates, or the rework limit is reached without
+# approval, the task moves to needs-human.
+#
+# [review]
+# profiles = ["local"]
+# max_reworks = 2
+# rework_profile = "local-edit"  # defaults to the task's own profile
+
 # A llama.cpp-style server on this machine. An openai backend returns text only
 # and cannot edit files.
 [[profiles]]
@@ -191,12 +202,45 @@ fn default_max_steps() -> u32 {
     DEFAULT_MAX_STEPS
 }
 
+const DEFAULT_MAX_REWORKS: u8 = 2;
+
+fn default_max_reworks() -> u8 {
+    DEFAULT_MAX_REWORKS
+}
+
+/// Configuration for the automated review and rework loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Profiles to run concurrently as reviewers. Empty means review is disabled.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Maximum number of rework cycles before escalating to needs-human.
+    #[serde(default = "default_max_reworks")]
+    pub max_reworks: u8,
+    /// Profile to run rework attempts with. Defaults to None (the task's own profile).
+    #[serde(default)]
+    pub rework_profile: Option<String>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            max_reworks: DEFAULT_MAX_REWORKS,
+            rework_profile: None,
+        }
+    }
+}
+
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub repo: PathBuf,
     pub default_profile: String,
+    #[serde(default)]
+    pub review: ReviewConfig,
     #[serde(default)]
     pub profiles: Vec<Profile>,
 }
@@ -259,6 +303,22 @@ impl Config {
                     });
                 }
             }
+        }
+
+        for reviewer in &self.review.profiles {
+            if !by_name.contains_key(reviewer.as_str()) {
+                return Err(CoreError::UnknownReviewProfile {
+                    profile: reviewer.clone(),
+                });
+            }
+        }
+
+        if let Some(rework_profile) = &self.review.rework_profile
+            && !by_name.contains_key(rework_profile.as_str())
+        {
+            return Err(CoreError::UnknownReviewProfile {
+                profile: rework_profile.clone(),
+            });
         }
 
         let mut state: HashMap<&str, Visit> = HashMap::new();
@@ -912,5 +972,80 @@ fallback = ["a"]
         let config = Config::from_toml_str(MINIMAL).unwrap();
         let text = toml::to_string(&config).unwrap();
         assert_eq!(Config::from_toml_str(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn review_config_defaults_when_omitted() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert_eq!(config.review.profiles, Vec::<String>::new());
+        assert_eq!(config.review.max_reworks, 2);
+        assert_eq!(config.review.rework_profile, None);
+    }
+
+    #[test]
+    fn review_config_parses_custom_values() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[review]
+profiles = ["agent"]
+max_reworks = 4
+rework_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["true"]
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        assert_eq!(config.review.profiles, vec!["agent"]);
+        assert_eq!(config.review.max_reworks, 4);
+        assert_eq!(config.review.rework_profile.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn review_config_rejects_unknown_reviewer_profile() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[review]
+profiles = ["ghost"]
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["true"]
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::UnknownReviewProfile {
+                profile: "ghost".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn review_config_rejects_unknown_rework_profile() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[review]
+profiles = ["agent"]
+rework_profile = "ghost"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["true"]
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::UnknownReviewProfile {
+                profile: "ghost".to_owned()
+            }
+        );
     }
 }
