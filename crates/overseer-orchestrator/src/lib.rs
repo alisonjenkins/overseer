@@ -37,7 +37,7 @@ pub use runner::{
     RunSummary, RunnerError, build_system_prompt, continue_task, continue_task_with_backend,
     continue_task_with_backends, run_task, run_task_with_backend,
 };
-pub use sources::SpecKitSource;
+pub use sources::{SourceBuildError, SpecKitSource, build_sources};
 pub use sync::{SyncError, SyncReport, sync_sources};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
 pub use worktree::{
