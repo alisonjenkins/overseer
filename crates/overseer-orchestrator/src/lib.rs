@@ -10,6 +10,8 @@ mod recovery;
 mod review;
 mod router;
 mod runner;
+mod sources;
+mod sync;
 mod worker;
 mod worktree;
 
@@ -35,6 +37,8 @@ pub use runner::{
     RunSummary, RunnerError, build_system_prompt, continue_task, continue_task_with_backend,
     continue_task_with_backends, run_task, run_task_with_backend,
 };
+pub use sources::SpecKitSource;
+pub use sync::{SyncError, SyncReport, sync_sources};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
 pub use worktree::{
     MergeError, Worktree, WorktreeError, branch_content_on_head, branch_name, diff, diff_stat,

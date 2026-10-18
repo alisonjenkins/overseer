@@ -1166,6 +1166,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         // First run the task to create branch & commit
@@ -1243,6 +1244,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1287,6 +1289,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1327,6 +1330,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1372,6 +1376,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1421,6 +1426,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1488,6 +1494,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1532,6 +1539,7 @@ mod tests {
             learning: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)

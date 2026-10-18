@@ -5,11 +5,12 @@ mod lesson;
 mod permissions;
 mod review;
 mod run;
+mod source;
 mod status;
 mod task;
 
 pub use config::{
-    BackendKind, Config, EscalationConfig, LearningConfig, Profile, ReviewConfig,
+    BackendKind, Config, EscalationConfig, LearningConfig, Profile, ReviewConfig, SourceConfig,
     is_valid_skill_name,
 };
 pub use lesson::{Lesson, LessonId, LessonStatus, NewLesson};
@@ -18,6 +19,7 @@ pub use review::{
     NewReview, ParsedReview, ReviewParseError, ReviewRecord, Verdict, parse_review, parse_verdict,
 };
 pub use run::{FailureKind, Run, RunFinish, RunId, RunOutcome, RunRequest, RunStatus, Usage};
+pub use source::{SourceError, SourcedTask, TaskSource};
 pub use status::TaskStatus;
 pub use task::{NewTask, Task, TaskId};
 
@@ -83,4 +85,10 @@ pub enum CoreError {
 
     #[error("escalation path glob {glob:?} is invalid: {message}")]
     InvalidEscalationGlob { glob: String, message: String },
+
+    #[error("source kind {kind:?} is invalid; expected 'speckit'")]
+    InvalidSourceKind { kind: String },
+
+    #[error("source path must not be empty")]
+    EmptySourcePath,
 }

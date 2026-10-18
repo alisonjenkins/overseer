@@ -67,6 +67,14 @@ default_profile = "local"
 # auto_merge = false
 # test_command = "cargo test"
 
+# External task sources (e.g. speckit specs).
+#
+# [[sources]]
+# kind = "speckit"
+# path = "specs"
+# profile = "local"
+# ready = false
+
 # A llama.cpp-style server on this machine. An openai backend returns text only
 # and cannot edit files.
 [[profiles]]
@@ -397,6 +405,18 @@ where
     Ok(opt.and_then(|s| (!s.is_empty()).then_some(s)))
 }
 
+/// Configuration for an external task source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    pub kind: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub ready: bool,
+}
+
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -413,6 +433,8 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub learning: LearningConfig,
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
 }
 
 impl Config {
@@ -526,6 +548,17 @@ impl Config {
                     glob: pattern.clone(),
                     message: err.to_string(),
                 });
+            }
+        }
+
+        for source in &self.sources {
+            if source.kind != "speckit" {
+                return Err(CoreError::InvalidSourceKind {
+                    kind: source.kind.clone(),
+                });
+            }
+            if source.path.as_os_str().is_empty() {
+                return Err(CoreError::EmptySourcePath);
             }
         }
 
@@ -1483,5 +1516,41 @@ model = "local"
             Config::from_toml_str(&text).unwrap().landing.test_command,
             None
         );
+    }
+
+    #[test]
+    fn sources_config_parses_and_defaults() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert!(config.sources.is_empty());
+
+        let text = format!(
+            "{MINIMAL}\n[[sources]]\nkind = \"speckit\"\npath = \"specs\"\nprofile = \"local\"\nready = true\n"
+        );
+        let parsed = Config::from_toml_str(&text).unwrap();
+        assert_eq!(parsed.sources.len(), 1);
+        let source = parsed.sources.first().unwrap();
+        assert_eq!(source.kind, "speckit");
+        assert_eq!(source.path, PathBuf::from("specs"));
+        assert_eq!(source.profile.as_deref(), Some("local"));
+        assert!(source.ready);
+
+        let minimal_source =
+            format!("{MINIMAL}\n[[sources]]\nkind = \"speckit\"\npath = \"specs\"\n");
+        let parsed_min = Config::from_toml_str(&minimal_source).unwrap();
+        let source = parsed_min.sources.first().unwrap();
+        assert_eq!(source.profile, None);
+        assert!(!source.ready);
+    }
+
+    #[test]
+    fn sources_config_rejects_invalid_kind_or_empty_path() {
+        let bad_kind = format!("{MINIMAL}\n[[sources]]\nkind = \"other\"\npath = \"specs\"\n");
+        assert!(matches!(
+            parse_err(&bad_kind),
+            CoreError::InvalidSourceKind { ref kind } if kind == "other"
+        ));
+
+        let empty_path = format!("{MINIMAL}\n[[sources]]\nkind = \"speckit\"\npath = \"\"\n");
+        assert!(matches!(parse_err(&empty_path), CoreError::EmptySourcePath));
     }
 }

@@ -782,6 +782,7 @@ mod tests {
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
             profiles: vec![profile("local"), profile("alt")],
             learning: Default::default(),
         }
@@ -1092,6 +1093,7 @@ mod tests {
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
             profiles,
             learning: Default::default(),
         }

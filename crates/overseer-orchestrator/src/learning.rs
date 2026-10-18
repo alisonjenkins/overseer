@@ -420,6 +420,7 @@ mod tests {
             review: Default::default(),
             escalation: Default::default(),
             landing: Default::default(),
+            sources: Default::default(),
         }
     }
 
