@@ -24,6 +24,9 @@ pub enum WorkerError {
 
     #[error("task execution failed")]
     Runner(#[from] RunnerError),
+
+    #[error("task review failed")]
+    Review(#[from] crate::review::ReviewError),
 }
 
 /// Options controlling the worker loop behavior.
@@ -126,7 +129,13 @@ pub async fn run_worker(
                     summary.attempts.len()
                 );
                 stats.tasks_executed = stats.tasks_executed.saturating_add(1);
-                if summary.status == TaskStatus::Review {
+                let final_status =
+                    if summary.status == TaskStatus::Review && !config.review.profiles.is_empty() {
+                        crate::review::run_review_loop(store, config, state_dir, task.id).await?
+                    } else {
+                        summary.status
+                    };
+                if final_status == TaskStatus::Review {
                     stats.tasks_succeeded = stats.tasks_succeeded.saturating_add(1);
                 } else {
                     stats.tasks_blocked = stats.tasks_blocked.saturating_add(1);
@@ -431,5 +440,56 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.tasks_executed, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_executes_review_loop_when_configured() {
+        let mut fx = fixture();
+        let mut config = test_config(&fx.repo);
+        config.review = overseer_core::ReviewConfig {
+            profiles: vec!["reviewer".to_owned()],
+            max_reworks: 2,
+            rework_profile: None,
+        };
+        config.profiles.push(fake_command_profile(
+            "reviewer",
+            "echo 'VERDICT: PASS' && echo 'Good job'",
+        ));
+
+        let (_, shutdown) = shutdown_pair();
+        let t = fx
+            .store
+            .add_task(NewTask {
+                title: "task with review".to_owned(),
+                profile: Some("succeed".to_owned()),
+                ready: true,
+                ..NewTask::default()
+            })
+            .unwrap();
+
+        let stats = run_worker(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            WorkerOptions {
+                once: true,
+                max_tasks: None,
+                poll_interval: Duration::from_millis(10),
+            },
+            shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.tasks_executed, 1);
+        assert_eq!(stats.tasks_succeeded, 1);
+
+        let task = fx.store.get_task(t.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Review);
+        assert!(task.approved);
+
+        let reviews = fx.store.list_reviews(t.id).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].verdict, overseer_core::Verdict::Pass);
     }
 }

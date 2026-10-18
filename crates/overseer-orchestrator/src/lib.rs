@@ -16,9 +16,16 @@ mod test_support;
 pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
 pub use lock::{WorkerLock, WorkerLockError, check_worker_status};
 pub use recovery::{RecoveryError, recover_interrupted};
-pub use review::{ReviewOutcome, aggregate_verdicts, build_reviewer_prompt, overall_verdict};
+pub use review::{
+    ReviewError, ReviewOutcome, ReviewerResult, aggregate_verdicts, build_reviewer_prompt,
+    build_rework_prompt, overall_verdict, review_task, review_task_with_backends, run_review_loop,
+    run_review_loop_with_backends,
+};
 pub use router::{RouterError, plan_attempts};
-pub use runner::{RunSummary, RunnerError, run_task, run_task_with_backend};
+pub use runner::{
+    RunSummary, RunnerError, continue_task, continue_task_with_backend,
+    continue_task_with_backends, run_task, run_task_with_backend,
+};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
 pub use worktree::{
     MergeError, Worktree, WorktreeError, branch_name, diff, diff_stat, discard, merge,

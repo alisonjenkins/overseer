@@ -104,7 +104,10 @@ pub async fn run_task(
         .iter()
         .map(|(name, backend)| (*name, backend.as_ref()))
         .collect();
-    execute(store, config, state_dir, task_id, &plan, &backends).await
+    execute(
+        store, config, state_dir, task_id, &plan, &backends, None, None,
+    )
+    .await
 }
 
 /// Like `run_task`, but with the backends supplied by the caller, keyed by
@@ -118,7 +121,10 @@ pub async fn run_task_with_backends(
 ) -> Result<RunSummary, RunnerError> {
     let task = store.get_task(task_id).map_err(store_step("load task"))?;
     let plan = plan_for(store, config, &task)?;
-    execute(store, config, state_dir, task_id, &plan, backends).await
+    execute(
+        store, config, state_dir, task_id, &plan, backends, None, None,
+    )
+    .await
 }
 
 /// Like `run_task_with_backends`, with one backend answering for every
@@ -136,6 +142,132 @@ pub async fn run_task_with_backend(
         .map(|profile| (profile.name.as_str(), backend))
         .collect();
     run_task_with_backends(store, config, state_dir, task_id, &backends).await
+}
+
+/// Continue an existing task worktree and branch with a new prompt and
+/// optionally an overridden profile.
+pub async fn continue_task(
+    store: &mut Store,
+    config: &Config,
+    state_dir: &Path,
+    task_id: TaskId,
+    profile_override: Option<&str>,
+    prompt: &str,
+) -> Result<RunSummary, RunnerError> {
+    let task = store.get_task(task_id).map_err(store_step("load task"))?;
+    let plan = plan_for_continue(store, config, &task, profile_override)?;
+    let built = plan
+        .iter()
+        .map(|profile| {
+            build_backend(profile)
+                .map(|backend| (profile.name.as_str(), backend))
+                .map_err(|source| RunnerError::BuildBackend {
+                    profile: profile.name.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let backends: HashMap<&str, &dyn Backend> = built
+        .iter()
+        .map(|(name, backend)| (*name, backend.as_ref()))
+        .collect();
+    let wt = Worktree {
+        path: worktree::worktree_path(state_dir, task_id),
+        branch: worktree::branch_name(task_id),
+    };
+    execute(
+        store,
+        config,
+        state_dir,
+        task_id,
+        &plan,
+        &backends,
+        Some(wt),
+        Some(prompt),
+    )
+    .await
+}
+
+/// Like `continue_task`, but with the backends supplied by the caller, keyed by
+/// profile name.
+pub async fn continue_task_with_backends(
+    store: &mut Store,
+    config: &Config,
+    state_dir: &Path,
+    task_id: TaskId,
+    profile_override: Option<&str>,
+    prompt: &str,
+    backends: &HashMap<&str, &dyn Backend>,
+) -> Result<RunSummary, RunnerError> {
+    let task = store.get_task(task_id).map_err(store_step("load task"))?;
+    let plan = plan_for_continue(store, config, &task, profile_override)?;
+    let wt = Worktree {
+        path: worktree::worktree_path(state_dir, task_id),
+        branch: worktree::branch_name(task_id),
+    };
+    execute(
+        store,
+        config,
+        state_dir,
+        task_id,
+        &plan,
+        backends,
+        Some(wt),
+        Some(prompt),
+    )
+    .await
+}
+
+/// Like `continue_task_with_backends`, with one backend answering for every
+/// profile in the config.
+pub async fn continue_task_with_backend(
+    store: &mut Store,
+    config: &Config,
+    state_dir: &Path,
+    task_id: TaskId,
+    profile_override: Option<&str>,
+    prompt: &str,
+    backend: &dyn Backend,
+) -> Result<RunSummary, RunnerError> {
+    let backends: HashMap<&str, &dyn Backend> = config
+        .profiles
+        .iter()
+        .map(|profile| (profile.name.as_str(), backend))
+        .collect();
+    continue_task_with_backends(
+        store,
+        config,
+        state_dir,
+        task_id,
+        profile_override,
+        prompt,
+        &backends,
+    )
+    .await
+}
+
+fn plan_for_continue<'a>(
+    store: &Store,
+    config: &'a Config,
+    task: &Task,
+    profile_override: Option<&str>,
+) -> Result<Vec<&'a Profile>, RunnerError> {
+    let name = profile_override
+        .or(task.profile.as_deref())
+        .unwrap_or(&config.default_profile);
+    let start = config
+        .profile(name)
+        .ok_or_else(|| RunnerError::UnknownProfile {
+            task_id: task.id,
+            profile: name.to_owned(),
+        })?;
+    let credits_low = store
+        .credits_low()
+        .map_err(store_step("read credits_low"))?;
+    plan_attempts(config, start, credits_low).map_err(|source| RunnerError::Route {
+        task_id: task.id,
+        source,
+    })
 }
 
 fn select_profile<'a>(config: &'a Config, task: &Task) -> Result<&'a Profile, RunnerError> {
@@ -171,15 +303,15 @@ fn store_step(step: &'static str) -> impl FnOnce(StoreError) -> RunnerError {
 
 /// The result of the backend call and the commit step, before the run is
 /// written to the store.
-struct Attempt {
-    output: String,
-    usage: Usage,
-    failure: Option<FailureKind>,
-    commit: Option<String>,
+pub(crate) struct Attempt {
+    pub(crate) output: String,
+    pub(crate) usage: Usage,
+    pub(crate) failure: Option<FailureKind>,
+    pub(crate) commit: Option<String>,
 }
 
 impl Attempt {
-    fn failed(kind: FailureKind) -> Self {
+    pub(crate) fn failed(kind: FailureKind) -> Self {
         Self {
             output: String::new(),
             usage: Usage::default(),
@@ -192,6 +324,7 @@ impl Attempt {
 /// Walk `plan` in order until an attempt succeeds, fails with `Other`, or the
 /// plan runs out. Every attempt is its own run row with its own transcript,
 /// all on the task's one worktree and branch.
+#[expect(clippy::too_many_arguments)]
 async fn execute(
     store: &mut Store,
     config: &Config,
@@ -199,6 +332,8 @@ async fn execute(
     task_id: TaskId,
     plan: &[&Profile],
     backends: &HashMap<&str, &dyn Backend>,
+    existing_worktree: Option<Worktree>,
+    prompt_override: Option<&str>,
 ) -> Result<RunSummary, RunnerError> {
     let steps = plan
         .iter()
@@ -211,15 +346,32 @@ async fn execute(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let task = store
-        .claim_task(task_id)
-        .map_err(store_step("claim task"))?;
 
-    let worktree = worktree::create(&config.repo, state_dir, task_id).await;
-    let branch = match &worktree {
-        Ok(worktree) => worktree.branch.clone(),
-        Err(_) => worktree::branch_name(task_id),
+    let (task, worktree, branch) = match existing_worktree {
+        Some(wt) => {
+            let task = store.get_task(task_id).map_err(store_step("load task"))?;
+            store
+                .set_status(task_id, TaskStatus::Running)
+                .map_err(store_step("set task status to running"))?;
+            let branch = wt.branch.clone();
+            (task, Ok(wt), branch)
+        }
+        None => {
+            let task = store
+                .claim_task(task_id)
+                .map_err(store_step("claim task"))?;
+            let worktree = worktree::create(&config.repo, state_dir, task_id).await;
+            let branch = match &worktree {
+                Ok(worktree) => worktree.branch.clone(),
+                Err(_) => worktree::branch_name(task_id),
+            };
+            (task, worktree, branch)
+        }
     };
+
+    let prompt = prompt_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| build_prompt(&task));
 
     let mut attempts: Vec<AttemptSummary> = Vec::new();
     let mut commit = None;
@@ -245,23 +397,26 @@ async fn execute(
                     worktree::discard_changes(&worktree.path).await
                 };
                 match ready {
-                    Ok(()) => run_in_worktree(backend, profile, &task, worktree).await,
+                    Ok(()) => run_in_worktree(backend, profile, &task, worktree, &prompt).await,
                     Err(err) => Attempt::failed(FailureKind::Other(format!("discard: {err}"))),
                 }
             }
             Err(err) => Attempt::failed(FailureKind::Other(format!("worktree: {err}"))),
         };
 
-        let transcript_path =
-            match write_transcript(state_dir, run_id, &task, profile, &branch, &attempt).await {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    attempt
-                        .failure
-                        .get_or_insert(FailureKind::Other(format!("transcript: {err}")));
-                    None
-                }
-            };
+        let transcript_path = match write_transcript(
+            state_dir, run_id, &task, profile, &branch, &prompt, &attempt,
+        )
+        .await
+        {
+            Ok(path) => Some(path),
+            Err(err) => {
+                attempt
+                    .failure
+                    .get_or_insert(FailureKind::Other(format!("transcript: {err}")));
+                None
+            }
+        };
 
         let status = if attempt.failure.is_none() {
             RunStatus::Succeeded
@@ -346,10 +501,11 @@ async fn run_in_worktree(
     profile: &Profile,
     task: &Task,
     worktree: &Worktree,
+    prompt: &str,
 ) -> Attempt {
     let request = RunRequest {
         system: profile.role_prompt.clone(),
-        prompt: build_prompt(task),
+        prompt: prompt.to_owned(),
         workdir: worktree.path.clone(),
         permissions: profile.permissions,
     };
@@ -395,19 +551,20 @@ fn commit_message(task: &Task) -> String {
 }
 
 /// Write the transcript atomically: temp file, then rename.
-async fn write_transcript(
+pub(crate) async fn write_transcript(
     state_dir: &Path,
     run_id: RunId,
     task: &Task,
     profile: &Profile,
     branch: &str,
+    prompt: &str,
     attempt: &Attempt,
 ) -> Result<PathBuf, std::io::Error> {
     let dir = state_dir.join("runs");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("{run_id}.md"));
     let tmp = dir.join(format!("{run_id}.md.tmp"));
-    let body = render_transcript(run_id, task, profile, branch, attempt);
+    let body = render_transcript(run_id, task, profile, branch, prompt, attempt);
     tokio::fs::write(&tmp, body).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(path)
@@ -418,6 +575,7 @@ fn render_transcript(
     task: &Task,
     profile: &Profile,
     branch: &str,
+    prompt: &str,
     attempt: &Attempt,
 ) -> String {
     let failure = attempt
@@ -441,7 +599,7 @@ fn render_transcript(
         profile_name = profile.name,
         input = attempt.usage.input_tokens,
         output = attempt.usage.output_tokens,
-        prompt = build_prompt(task),
+        prompt = prompt,
         output_text = attempt.output,
     )
 }
@@ -591,6 +749,49 @@ mod tests {
         assert!(transcript.contains("wrote the file"), "{transcript}");
         assert!(transcript.contains("Task 1: write parser"), "{transcript}");
         assert!(transcript.contains("handle quotes"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn continue_task_modifies_existing_worktree() {
+        let mut fx = fixture();
+        let config = config(&fx.repo);
+        let task = add(&mut fx.store, "feature", "build it");
+        let backend1 = WritingBackend {
+            file: "out.txt",
+            content: "version 1\n",
+        };
+
+        let summary1 = run_task_with_backend(&mut fx.store, &config, &fx.state, task, &backend1)
+            .await
+            .unwrap();
+        assert_eq!(summary1.status, TaskStatus::Review);
+
+        let backend2 = WritingBackend {
+            file: "out.txt",
+            content: "version 2\n",
+        };
+        let summary2 = continue_task_with_backend(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            task,
+            None,
+            "Rework: update version",
+            &backend2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary2.status, TaskStatus::Review);
+        let head = git_sync(&fx.repo, &["rev-parse", "refs/heads/overseer/task-1"]);
+        assert_eq!(summary2.commit.unwrap(), head.trim());
+
+        // Check file content in the worktree
+        let wt_file = fx.state.join("worktrees/task-1/out.txt");
+        assert_eq!(std::fs::read_to_string(wt_file).unwrap(), "version 2\n");
+
+        let runs = fx.store.list_runs(task).unwrap();
+        assert_eq!(runs.len(), 2);
     }
 
     #[tokio::test]

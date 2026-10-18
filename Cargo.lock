@@ -1058,6 +1058,7 @@ name = "overseer-orchestrator"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "overseer-backends",
  "overseer-core",
  "overseer-store",

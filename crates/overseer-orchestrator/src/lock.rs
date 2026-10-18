@@ -98,6 +98,12 @@ impl WorkerLock {
     }
 }
 
+impl Drop for WorkerLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 /// Check if another worker holds the lock, returning its PID if so.
 pub fn check_worker_status(state_dir: &Path) -> Result<Option<u32>, std::io::Error> {
     let path = state_dir.join("worker.lock");
