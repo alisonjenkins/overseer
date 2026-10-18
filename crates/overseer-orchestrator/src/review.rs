@@ -14,6 +14,8 @@ use crate::worktree::{self, WorktreeError};
 
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 const TRUNCATION_NOTE: &str = "\n\n[Diff truncated to 60 KB; remaining lines omitted]";
+const MAX_FILE_LINES: usize = 400;
+const MAX_TOTAL_FILE_BYTES: usize = 60_000;
 
 /// Outcome of aggregating reviewer verdicts for a task round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,14 +147,81 @@ fn truncate_diff(diff: &str) -> (String, bool) {
     (out, true)
 }
 
-/// Build the reviewer prompt containing the task title, body, and the unified diff.
+fn extract_diff_paths(diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff.lines() {
+        let raw = if let Some(rest) = line.strip_prefix("diff --git ") {
+            rest.rfind(" b/")
+                .and_then(|i| rest.get(i.saturating_add(3)..))
+        } else {
+            line.strip_prefix("+++ b/")
+        };
+        if let Some(mut path) = raw.map(str::trim) {
+            if let Some(unquoted) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+                path = unquoted;
+            }
+            if !path.is_empty() && path != "/dev/null" && !paths.iter().any(|p| p == path) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
+}
+
+fn append_file_contents(prompt: &mut String, diff: &str, worktree: &Path) {
+    let paths = extract_diff_paths(diff);
+    let mut total_added_bytes = 0usize;
+
+    for path in paths {
+        let file_path = worktree.join(&path);
+        if !file_path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&file_path) else {
+            continue;
+        };
+        if total_added_bytes >= MAX_TOTAL_FILE_BYTES {
+            break;
+        }
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        let mut file_buf = String::new();
+        let mut included_lines = 0usize;
+
+        for line in lines.iter().take(MAX_FILE_LINES) {
+            let line_bytes = line.len().saturating_add(1);
+            if total_added_bytes.saturating_add(line_bytes) > MAX_TOTAL_FILE_BYTES {
+                break;
+            }
+            file_buf.push_str(line);
+            file_buf.push('\n');
+            total_added_bytes = total_added_bytes.saturating_add(line_bytes);
+            included_lines = included_lines.saturating_add(1);
+        }
+
+        let omitted = total_lines.saturating_sub(included_lines);
+        if omitted > 0 {
+            if omitted == 1 {
+                file_buf.push_str("[1 line omitted]\n");
+            } else {
+                file_buf.push_str(&format!("[{omitted} lines omitted]\n"));
+            }
+        }
+
+        prompt.push_str(&format!("### File: {path}\n```\n{file_buf}```\n\n"));
+    }
+}
+
+/// Build the reviewer prompt containing the task title, body, the unified diff,
+/// and full contents of changed files existing in the worktree.
 /// Truncates the diff to 60 KB with an explanatory note if longer.
 /// Explicitly instructs the model:
 /// - Reply with the verdict line first (`VERDICT: PASS`, `VERDICT: CHANGES`, or `VERDICT: ESCALATE`)
 /// - Follow with a short bullet list of problems (CHANGES) or reasons (ESCALATE)
 /// - Do NOT use tools or run commands
 /// - Do NOT edit files
-pub fn build_reviewer_prompt(title: &str, body: &str, diff: &str) -> String {
+pub fn build_reviewer_prompt(title: &str, body: &str, diff: &str, worktree: &Path) -> String {
     let (diff_content, _) = truncate_diff(diff);
     let mut prompt = String::new();
     prompt.push_str("Task Title: ");
@@ -167,6 +236,7 @@ pub fn build_reviewer_prompt(title: &str, body: &str, diff: &str) -> String {
     prompt.push_str("\nDiff against base branch:\n```diff\n");
     prompt.push_str(&diff_content);
     prompt.push_str("\n```\n\n");
+    append_file_contents(&mut prompt, diff, worktree);
     prompt.push_str(
         "Instructions for review:\n\
          1. You are reviewing the changes above for the task described.\n\
@@ -244,8 +314,8 @@ pub async fn review_task_with_backends(
             source,
         })?;
 
-    let prompt = build_reviewer_prompt(&task.title, &task.body, &diff);
     let worktree_dir = worktree::worktree_path(state_dir, task_id);
+    let prompt = build_reviewer_prompt(&task.title, &task.body, &diff, &worktree_dir);
     let round_dir = state_dir
         .join("reviews")
         .join(format!("task-{}", task_id))
@@ -640,6 +710,21 @@ pub async fn run_review_loop(
     run_review_loop_with_backends(store, config, state_dir, task_id, &backends).await
 }
 
+fn extract_escalate_bullet(feedback: &str) -> Option<String> {
+    for line in feedback.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(['-', '*', '+', '•']) {
+            let content = trimmed.trim_start_matches(|c: char| {
+                c == '-' || c == '*' || c == '+' || c == '•' || c.is_whitespace()
+            });
+            if !content.is_empty() {
+                return Some(trimmed.chars().take(200).collect());
+            }
+        }
+    }
+    None
+}
+
 /// Like `run_review_loop`, but with backends supplied by caller.
 pub async fn run_review_loop_with_backends(
     store: &mut Store,
@@ -680,8 +765,15 @@ pub async fn run_review_loop_with_backends(
                 return Ok(TaskStatus::Review);
             }
             ReviewOutcome::NeedsHuman => {
+                let reason = (overall == Verdict::Escalate).then(|| {
+                    let first_esc = results.iter().find(|r| r.verdict == Verdict::Escalate);
+                    match first_esc.and_then(|r| extract_escalate_bullet(&r.feedback)) {
+                        Some(bullet) => format!("escalation: reviewer: {bullet}"),
+                        None => "escalation: reviewer: no reason given".to_owned(),
+                    }
+                });
                 store
-                    .set_status(task_id, TaskStatus::NeedsHuman)
+                    .set_status_with_reason(task_id, TaskStatus::NeedsHuman, reason.as_deref())
                     .map_err(store_step("set needs-human"))?;
                 return Ok(TaskStatus::NeedsHuman);
             }
@@ -859,7 +951,7 @@ mod tests {
         let body = "Ensure tokenizer returns empty token stream on empty input.";
         let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}\n";
 
-        let prompt = build_reviewer_prompt(title, body, diff);
+        let prompt = build_reviewer_prompt(title, body, diff, Path::new(""));
 
         assert!(prompt.contains("Task Title: Fix parser null pointer"));
         assert!(prompt.contains("Ensure tokenizer returns empty token stream on empty input."));
@@ -878,13 +970,55 @@ mod tests {
         let body = "Lots of lines changed.";
         let large_diff = "a".repeat(65_000);
 
-        let prompt = build_reviewer_prompt(title, body, &large_diff);
+        let prompt = build_reviewer_prompt(title, body, &large_diff, Path::new(""));
 
         assert!(prompt.contains("Diff truncated to 60 KB"));
         let (truncated, is_truncated) = truncate_diff(&large_diff);
         assert!(is_truncated);
         assert!(truncated.contains("Diff truncated to 60 KB"));
         assert!(truncated.len() <= MAX_DIFF_BYTES + TRUNCATION_NOTE.len());
+    }
+
+    #[test]
+    fn build_reviewer_prompt_includes_file_contents_for_small_file() {
+        let root = tempfile::tempdir().unwrap();
+        let src_dir = root.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("lib.rs");
+        std::fs::write(
+            &file_path,
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+    a + b\n";
+        let prompt =
+            build_reviewer_prompt("Add function", "Add an add function", diff, root.path());
+
+        assert!(prompt.contains("### File: src/lib.rs"));
+        assert!(prompt.contains("pub fn add(a: i32, b: i32) -> i32 {"));
+        assert!(prompt.contains("a + b"));
+        assert!(!prompt.contains("omitted"));
+    }
+
+    #[test]
+    fn build_reviewer_prompt_truncates_file_over_400_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let file_path = root.path().join("large.rs");
+        let mut content = String::new();
+        for i in 0..450 {
+            content.push_str(&format!("// line {i}\n"));
+        }
+        std::fs::write(&file_path, &content).unwrap();
+
+        let diff = "diff --git a/large.rs b/large.rs\n+// line 42\n";
+        let prompt = build_reviewer_prompt("Big file", "Lots of lines", diff, root.path());
+
+        assert!(prompt.contains("### File: large.rs"));
+        assert!(prompt.contains("// line 0"));
+        assert!(prompt.contains("// line 399"));
+        assert!(!prompt.contains("// line 400"));
+        assert!(prompt.contains("[50 lines omitted]"));
     }
 
     #[test]
@@ -1363,6 +1497,56 @@ mod tests {
         assert_eq!(task.status, TaskStatus::NeedsHuman);
         assert_eq!(task.reason.as_deref(), Some("escalation: Cargo.toml"));
         assert_eq!(rev.responses.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_review_loop_reviewer_escalate_sets_reason() {
+        let mut fix = fixture();
+        let task_id = add_task(&mut fix.store, "rework escalate");
+
+        let worker = WorkerBackend::new("work.txt");
+        let rev = SequentialReviewBackend::new(vec![
+            "VERDICT: ESCALATE\n\n- Needs human approval for migration".to_owned(),
+        ]);
+
+        let mut backends: HashMap<&str, &dyn Backend> = HashMap::new();
+        backends.insert("local", &worker);
+        backends.insert("rev", &rev);
+
+        let config = Config {
+            repo: fix.repo.clone(),
+            default_profile: "local".to_owned(),
+            review: overseer_core::ReviewConfig {
+                profiles: vec!["rev".to_owned()],
+                max_reworks: 1,
+                rework_profile: None,
+            },
+            profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
+            escalation: Default::default(),
+        };
+
+        run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+            .await
+            .unwrap();
+
+        let status =
+            run_review_loop_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+                .await
+                .unwrap();
+
+        assert_eq!(status, TaskStatus::NeedsHuman);
+        let task = fix.store.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsHuman);
+        let reason = task.reason.as_deref().expect("expected escalation reason");
+        assert!(
+            reason.starts_with("escalation: reviewer:"),
+            "expected prefix 'escalation: reviewer:', got {reason:?}"
+        );
+        assert!(
+            reason.contains("Needs human approval for migration"),
+            "expected reason to contain bullet text, got {reason:?}"
+        );
     }
 
     #[test]
