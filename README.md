@@ -9,6 +9,42 @@ the `openai` and `command` backends, per-task worktrees, fallback routing with
 credits-low mode, and the `overseer` CLI for `init`, `task`, `run`, `runs` and
 `mode`.
 
+## Installation
+
+Run directly via the flake:
+
+```sh
+nix run github:alisonjenkins/overseer -- --help
+```
+
+Build the binary into `./result`:
+
+```sh
+nix build github:alisonjenkins/overseer
+# or from a local checkout:
+nix build
+./result/bin/overseer --help
+```
+
+### Flake overlay and Home Manager
+
+Add the input and apply `overlays.default`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    overseer.url = "github:alisonjenkins/overseer";
+  };
+
+  outputs = { self, nixpkgs, overseer, ... }: {
+    # In a NixOS or Home Manager configuration:
+    nixpkgs.overlays = [ overseer.overlays.default ];
+    home.packages = [ pkgs.overseer ];
+  };
+}
+```
+
 ## Build and test
 
 The toolchain comes from the Nix dev shell. Run cargo through it:
