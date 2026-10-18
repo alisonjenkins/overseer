@@ -7,3 +7,12 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+overseer-core = { version = "0.1.0", path = "../overseer-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
