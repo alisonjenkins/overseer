@@ -15,6 +15,7 @@ overseer-core = { version = "0.1.0", path = "../overseer-core" }
 overseer-store = { version = "0.1.0", path = "../overseer-store" }
 futures-util = "0.3"
 globset = "0.4.16"
+notify = "8"
 serde_json = "1.0.154"
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt", "sync", "time"] }

@@ -12,6 +12,7 @@ mod router;
 mod runner;
 mod sources;
 mod sync;
+pub mod watch;
 mod worker;
 mod worktree;
 
@@ -39,6 +40,7 @@ pub use runner::{
 };
 pub use sources::{SourceBuildError, SpecKitSource, build_sources};
 pub use sync::{SyncError, SyncReport, sync_sources};
+pub use watch::{SourceWatcher, WatchError, start};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
 pub use worktree::{
     MergeError, Worktree, WorktreeError, branch_content_on_head, branch_name, diff, diff_stat,
