@@ -64,6 +64,7 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Adds a new task to the store.
     pub fn add_task(&mut self, new: NewTask) -> Result<Task, StoreError> {
         let NewTask {
             title,
