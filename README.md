@@ -4,11 +4,12 @@ Overseer is a single-user, local-first task orchestrator. It keeps a queue of
 software tasks in SQLite and is meant to hand them to whichever model backend
 is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
-lists the milestones. This repository currently implements M4: the task store,
+lists the milestones. This repository currently implements M5: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
 credits-low mode, the worker queue drainer with single-worker locking and crash
-recovery, and the `overseer` CLI for `init`, `config`, `task`, `run`, `runs`, `worker`,
-`status`, `mode`, `doctor`, `diff`, `merge` and `discard`.
+recovery, an automated review and bounded rework loop, and the `overseer` CLI for
+`init`, `config`, `task`, `run`, `runs`, `review`, `worker`, `status`, `mode`,
+`doctor`, `diff`, `merge` and `discard`.
 
 ## Installation
 
@@ -99,12 +100,14 @@ counts and failure.
 
 ## Reviewing and landing tasks
 
-Once a task reaches `review`, you can inspect what it produced, merge it into
-your repository branch, or discard it back to the backlog.
+Once a task reaches `review`, you can inspect what it produced, run automated
+reviews, merge it into your repository branch, or discard it back to the backlog.
 
 ```sh
 overseer diff 1
 overseer diff 1 --stat
+overseer review 1
+overseer task show 1
 overseer merge 1
 overseer discard 1
 ```
@@ -112,6 +115,10 @@ overseer discard 1
 - `overseer diff <id> [--stat]` prints the unified diff (or `--stat` summary)
   between the base branch tip and the task branch `overseer/task-<id>`,
   without invoking a pager.
+- `overseer review <id>` manually runs the review and rework loop on a task in
+  `review`.
+- `overseer task show <id>` displays task details including priority, profile,
+  round, whether the task is approved, and a table of all recorded reviews.
 - `overseer merge <id>` checks that the repository working tree is clean and
   that HEAD is on the branch the task branched from. It runs
   `git merge-tree --write-tree HEAD <branch>` first and returns a conflict error
@@ -119,10 +126,77 @@ overseer discard 1
   `git merge --no-ff -m "overseer: merge task <id>: <title>" <branch>`, removes
   the task worktree, deletes the branch with `git branch -d`, sets the task
   status to `done`, and prints the merge commit sha. Tasks may only be merged
-  from status `review`.
+  from status `review`. If the task has recorded reviews but has not been
+  approved, a warning is printed (`warning: task <id> has reviews and is not approved`)
+  before merging.
 - `overseer discard <id>` removes the task worktree and branch (`git branch -D`)
   and resets the task status to `backlog`. It refuses unless the task status is
   `review` or `blocked`.
+
+## Automated review and rework loop
+
+When `[review].profiles` is configured with one or more profile names, Overseer
+runs an automated review and rework loop after each successful build run (in both
+`overseer worker` and `overseer run`), or on demand via `overseer review <id>`.
+
+```toml
+[review]
+profiles = ["local"]             # reviewers to run concurrently (empty disables review)
+max_reworks = 2                  # maximum rework cycles before escalating (default 2)
+# rework_profile = "local-edit"  # optional profile for rework runs (defaults to task profile)
+```
+
+### Reviewer execution and prompt
+
+For the task's current round, all configured reviewer profiles run
+concurrently using their normal attempt plan (including fallback chains and
+credits-low skipping). Reviewers run with a permission ceiling of `read`.
+
+Each reviewer receives a prompt containing:
+- The task title and body.
+- The unified diff of the task branch against the base branch (truncated to 60 KB
+  with an explanatory notice if larger).
+- Instructions to return a verdict on the first non-empty line followed by a
+  bulleted list of concrete problems or reasons.
+- Explicit instructions not to use tools, run shell commands, or edit files.
+
+The first non-empty line of the reviewer output must be an exact verdict:
+- `VERDICT: PASS`: changes are accepted as-is.
+- `VERDICT: CHANGES`: modifications are requested before approval.
+- `VERDICT: ESCALATE`: architectural concerns, policy issues, or problems
+  requiring human judgment.
+
+Any other initial line is unparseable. If a reviewer fails to run or returns an
+unparseable verdict, Overseer retries it once. If the retry also fails or is
+unparseable, the result is recorded as `ESCALATE` with an explanatory note.
+
+Each reviewer's response is written to:
+`<state-dir>/reviews/task-<id>/round-<n>/<profile>.md`
+and recorded in the SQLite `reviews` table (`id`, `task_id`, `round`, `profile`,
+`verdict`, `path`, `created_at`).
+
+### Aggregation and rework
+
+When all reviewers in a round finish (the round barrier), Overseer logs a summary
+line:
+
+```text
+task 1 round 0: CHANGES (reviewers: local=CHANGES)
+```
+
+Verdicts are aggregated as follows:
+1. **Any `ESCALATE`**: The task status transitions to `needs-human`.
+2. **Any `CHANGES`**:
+   - If `round < max_reworks`: Overseer builds a follow-up rework prompt
+     concatenating the reviewer feedback, increments `round`, and runs the task
+     again on the **existing** worktree and branch (without starting over) using
+     `rework_profile` (or the task's original profile if unspecified). Changes
+     are committed to the branch, and the review loop continues with the next
+     round.
+   - If `round >= max_reworks`: Rework budget is exhausted; the task status
+     transitions to `needs-human`.
+3. **All `PASS`**: The task remains in `review` and is marked `approved` (`approved = true`),
+   ready for `overseer merge`.
 
 ## Draining the queue with the worker
 
@@ -416,8 +490,11 @@ and `NOTHING USABLE` otherwise.
 
 ### Exit codes
 
-- `overseer run` exits `0` when the task ends in `review`, `2` when it ends
-  `blocked`, and `1` on an overseer error. It prints one line per attempt.
+- `overseer run` exits `0` when the task ends in `review` or `needs-human`, `2`
+  when it ends `blocked`, and `1` on an overseer error. It prints one line per attempt.
+- `overseer review` exits `0` when the review loop finishes (approved in `review`
+  or escalated to `needs-human`), `2` on refusal (if the task is not in status `review`),
+  and `1` on an overseer error.
 - `overseer doctor` exits `0` when the default attempt plan is `usable`, `2`
   when the verdict is `NOTHING USABLE`, and `1` on an overseer error.
 - `overseer merge` and `overseer discard` exit `0` on success, `2` on refusal or
@@ -426,6 +503,18 @@ and `NOTHING USABLE` otherwise.
   `--max-tasks`) or when cleanly stopped by a signal, `3` when another worker
   holds the lock, `130` when terminated immediately by a second shutdown
   signal, and `1` on an overseer error.
+
+## Review field reference
+
+The optional `[review]` table in `overseer.toml` configures automated code review:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `profiles` | array of strings | `[]` | Profile names run concurrently as reviewers. If empty, review is disabled. |
+| `max_reworks` | integer | `2` | Maximum rework cycles permitted before escalating to `needs-human`. |
+| `rework_profile` | string | none | Profile used for rework runs. Defaults to the task's own profile. |
+
+Review configuration is validated on load: reviewer profile names and `rework_profile` must exist in `[[profiles]]`.
 
 ## Profile field reference
 
