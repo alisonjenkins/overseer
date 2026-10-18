@@ -13,6 +13,7 @@ Reviewed 2026-10-18. Where this section and a later one disagree, this section w
 7. **Async**: tokio runtime; `rusqlite` calls run in `spawn_blocking` behind a single store actor, which is the single writer.
 8. **Profiles** also carry `capabilities` tags (`code`, `review`, `summarise`) and a `permissions` ceiling. Profiles live in `overseer.toml`, not the DB.
 9. **MVP milestones are re-ordered** (see section 10): the goal is "queue a task, a local model does it, Gemini takes over when the local one is down" by M3.
+10. **Chat-completions backends do not edit files**: a chat-completions backend returns text only and cannot edit files. File-editing tasks run through harness CLIs (agy, claude, opencode) via the `command`/`agy`/`claude` backends, which edit the worktree themselves. A built-in read/write/edit/run tool loop for the `openai` backend is milestone M2b (after M3).
 
 ## 1. Problem, Goals, and Non-Goals
 
@@ -325,6 +326,7 @@ Each milestone is a set of small atomic commits and leaves `cargo test` and `nix
 1. **M1: Skeleton and store**: Nix flake + workspace, `core` types, `store` (SQLite schema, task CRUD), `overseer init`, `task add|list|show`. Mock backend exists from here.
 2. **M2: OpenAI-compatible backend and `run`**: `openai` backend (non-streaming, long timeout, `reasoning_content` ignored), worktree + branch per task, `overseer run <id>` builds a prompt from task + role prompt, runs it, stores transcript and usage, leaves the branch for inspection. A local llama.cpp model can now do a task.
 3. **M3: `agy`/`claude` backends and fallback**: `agy` and `claude -p` backends, failure classification, per-profile `fallback` lists, `credits_low` mode. Gemini takes over when the local server is down.
+   - **M2b: tool loop**: built-in read/write/edit/run tool loop for the `openai` backend (after M3; see section 0, decision 10).
 4. **M4: Worker**: `overseer worker` loop with dependency-aware claim, one task at a time, graceful shutdown, crash recovery of `running` tasks.
 5. **M5: Review loop**: reviewer and approver runs, `VERDICT:` parsing, round barrier, max 2 reworks, orchestrator-only merge after `git merge-tree` check.
 6. **M6: Hard escalation**: diff-path globs from `escalation.toml`.
