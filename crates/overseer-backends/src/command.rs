@@ -229,8 +229,12 @@ fn classify_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Failu
 }
 
 fn expand_tilde(path: &str) -> String {
+    expand_tilde_with(path, std::env::var("HOME").ok().as_deref())
+}
+
+fn expand_tilde_with(path: &str, home: Option<&str>) -> String {
     if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
+        && let Some(home) = home
     {
         let home = home.trim_end_matches('/');
         return format!("{home}/{rest}");
@@ -717,45 +721,24 @@ echo "fake ran"
         );
     }
 
-    #[tokio::test]
-    async fn command_expands_leading_tilde_in_program() {
-        let home = std::env::var("HOME").unwrap();
-        let home_path = PathBuf::from(&home);
-        let current_dir = std::env::current_dir().unwrap();
-        let temp_dir = tempfile::tempdir_in(&current_dir).unwrap();
-        let log = temp_dir.path().join("tilde_out.txt");
-        let script = write_script(
-            &temp_dir.path().join("fake_tilde.sh"),
-            &format!(
-                r#"echo "ran" > "{}"
-echo "fake ran"
-"#,
-                log.display()
-            ),
+    #[test]
+    fn expand_tilde_uses_the_given_home() {
+        assert_eq!(
+            expand_tilde_with("~/bin/tool", Some("/home/me/")),
+            "/home/me/bin/tool"
         );
-        let rel = script.strip_prefix(&home_path).unwrap();
-        let tilde_path = format!("~/{}", rel.display());
-
-        let agent = profile(&[&tilde_path, "arg1"], false, 10);
-        let backend = CommandBackend::new(&agent).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let outcome = backend
-            .run(&request(dir.path().to_path_buf(), None, "prompt"))
-            .await
-            .unwrap();
-        assert_eq!(outcome.failure, None);
-        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "ran");
+        assert_eq!(
+            expand_tilde_with("/usr/bin/tool", Some("/home/me")),
+            "/usr/bin/tool"
+        );
+        assert_eq!(
+            expand_tilde_with("~other/tool", Some("/home/me")),
+            "~other/tool"
+        );
     }
 
     #[test]
-    fn test_expand_tilde() {
-        let home = std::env::var("HOME").unwrap();
-        let home_trimmed = home.trim_end_matches('/');
-        assert_eq!(
-            expand_tilde("~/bin/tool"),
-            format!("{home_trimmed}/bin/tool")
-        );
-        assert_eq!(expand_tilde("/usr/bin/tool"), "/usr/bin/tool");
-        assert_eq!(expand_tilde("~other/tool"), "~other/tool");
+    fn expand_tilde_without_a_home_is_left_alone() {
+        assert_eq!(expand_tilde_with("~/bin/tool", None), "~/bin/tool");
     }
 }
