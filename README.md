@@ -4,12 +4,12 @@ Overseer is a single-user, local-first task orchestrator. It keeps a queue of
 software tasks in SQLite and is meant to hand them to whichever model backend
 is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
-lists the milestones. This repository implements M7: the task store,
+lists the milestones. This repository implements M6 and M7: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
 credits-low mode, the worker queue drainer with single-worker locking and crash
-recovery, an automated review and bounded rework loop, skills injected into prompts,
-a learning loop proposing improvements from finished tasks as reviewable lessons,
-and the `overseer` CLI for all operations.
+recovery, an automated review and bounded rework loop, hard escalation on sensitive
+paths, skills injected into prompts, a learning loop proposing improvements from
+finished tasks as reviewable lessons, and the `overseer` CLI for all operations.
 
 ## Installation
 
@@ -108,6 +108,7 @@ overseer diff 1
 overseer diff 1 --stat
 overseer review 1
 overseer task show 1
+overseer approve 1
 overseer merge 1
 overseer discard 1
 ```
@@ -118,7 +119,9 @@ overseer discard 1
 - `overseer review <id>` manually runs the review and rework loop on a task in
   `review`.
 - `overseer task show <id>` displays task details including priority, profile,
-  round, whether the task is approved, and a table of all recorded reviews.
+  round, whether the task is approved, reason (when set), and a table of all recorded reviews.
+- `overseer approve <id>` approves a task halted at `needs-human` due to an
+  escalation, moving it to `review` so it can be merged.
 - `overseer merge <id>` checks that the repository working tree is clean and
   that HEAD is on the branch the task branched from. It runs
   `git merge-tree --write-tree HEAD <branch>` first and returns a conflict error
@@ -197,6 +200,55 @@ Verdicts are aggregated as follows:
      transitions to `needs-human`.
 3. **All `PASS`**: The task remains in `review` and is marked `approved` (`approved = true`),
    ready for `overseer merge`.
+
+## Hard escalation
+
+Regardless of model confidence or reviewer verdicts, a task whose branch touches
+sensitive paths must stop for human review. Overseer inspects the git diff of the
+task branch against its base (`git diff --name-only <base>...<branch>`) after every
+successful build or rework run. If any changed file matches the escalation rules, the
+task immediately transitions to `needs-human` with an escalation reason **before** any
+review runs, and the worker treats it as finished without retrying.
+
+```toml
+[escalation]
+enabled = true          # whether sensitive path checks are active (default: true)
+paths = [               # file globs triggering escalation (defaults shown below)
+  ".github/**",
+  ".gitlab-ci.yml",
+  "**/migrations/**",
+  "**/auth/**",
+  "**/*.tf",
+  "Dockerfile*",
+  "**/Dockerfile*",
+  "deploy/**",
+  "Cargo.toml",
+  "**/Cargo.toml",
+  "package.json",
+  "**/package.json",
+  "flake.nix",
+  ".env*",
+  "**/secrets/**",
+]
+```
+
+### Escalation behavior
+
+1. **Trigger**: After any build or rework run that produced changes, the changed paths
+   are matched against `[escalation].paths` using `globset`. Globs are validated at
+   config load; invalid patterns produce an error immediately.
+2. **Halt**: When any changed path matches, the task status is set to `needs-human` and
+   the reason is recorded (e.g. `escalation: Cargo.toml`). No reviewer profiles are run.
+3. **Worker logging**: The worker logs the escalation and does not retry the task:
+   ```text
+   task 1 modify dependencies: needs-human (escalation: Cargo.toml)
+   ```
+4. **Inspection and approval**:
+   - `overseer task show <id>` displays the recorded `reason`.
+   - `overseer merge <id>` refuses any task in `needs-human`.
+   - `overseer approve <id>` validates that the task is in `needs-human` with an
+     escalation reason, marks it approved (`approved = true`), and moves it to
+     `review` with an approval record so that it can be merged with `overseer merge <id>`.
 
 ## Draining the queue with the worker
 
@@ -515,6 +567,17 @@ The optional `[review]` table in `overseer.toml` configures automated code revie
 | `rework_profile` | string | none | Profile used for rework runs. Defaults to the task's own profile. |
 
 Review configuration is validated on load: reviewer profile names and `rework_profile` must exist in `[[profiles]]`.
+
+## Escalation field reference
+
+The optional `[escalation]` table in `overseer.toml` configures sensitive path escalation:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | When false, path escalation checks are skipped entirely. |
+| `paths` | array of strings | default 15 globs | Glob patterns checked against changed files in the branch diff. |
+
+Globs are validated on config load: invalid glob syntax produces a configuration error immediately.
 
 ## Skills
 
