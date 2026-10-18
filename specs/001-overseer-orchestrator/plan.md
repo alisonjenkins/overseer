@@ -316,3 +316,40 @@ crates/
 | Synchronous `rusqlite` behind single writer | Deterministic local persistence without async connection pool overhead. | `sqlx` async connection pools introduce connection contention and unnecessary async complexity for a single-user local tool. |
 | Git worktree isolation per task | Ensures model file changes and tests never touch the developer's working directory. | In-place execution risks overwriting uncommitted developer work and breaking active editor state. |
 | Strict First-Line `VERDICT:` Protocol | Deterministic parsing of model evaluations without fragile JSON parsing or hallucinated keys. | Free-form markdown parsing or complex schemas frequently fail across smaller local models (e.g., 8B/14B Qwen/Llama). |
+
+## Component Boundaries and Monitoring
+
+### Components and Roles
+
+- **Store (`overseer-store`)**: The only shared state. Its contract is the schema and its migrations.
+- **Producers (the runner, review and sync code)**: Write rows through store functions. They do not know any reader exists.
+- **Landing**: Reads task and verdict rows, runs git and gh as subprocesses.
+- **CLI (`overseer-cli`)**: A thin layer that parses arguments, calls store or orchestrator functions and prints. Monitoring commands read rows only.
+- **Web**: A separate binary, `overseer-web`. It serves JSON read from the store and a static page. It does not depend on overseer-orchestrator.
+
+### Boundary Data Crossing
+
+Plain data only, that is store rows or NDJSON and JSON output. No type from one crate is used as an argument or return value across a monitoring boundary.
+
+### Dependency Rules
+
+`overseer-web` depends on `overseer-store` and on no orchestrator crate. Monitoring commands depend on the store read API only.
+
+### Unix Conventions
+
+Unix conventions for every CLI command added here:
+- Data on stdout
+- Diagnostics on stderr
+- Exit codes that scripts can test
+- `--json` for machine output
+- Silence on success
+- No interactive prompts
+
+### Known Coupling to Fix
+
+The review prompt puts whole file contents into the reviewer context with no budget tied to the profile's context size. A task run on a 32k-token local server (for example task 43 in the dogfood queue, which failed with `exceeds the available context size (32768 tokens)`) shows the boundary is missing. Record it as a boundary problem.
+
+### Supersedes
+
+The HTTP API in phase 7 (T063) is replaced by `overseer-web` (see tasks T079 and T080).
+

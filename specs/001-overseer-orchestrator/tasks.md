@@ -121,3 +121,18 @@ description: "Task list for Overseer task orchestrator implementation"
 - **Phase 5 (User Story 3)**: Depends on Phase 4; implements sensitive path safety gates and branch landing.
 - **Phase 6 (User Story 4)**: Depends on Phase 5; implements background queue draining, learning, and SpecKit sync.
 - **Phase 7 (Future)**: Depends on Phase 6; optional HTTP API for remote automation.
+
+## Phase 8: Monitoring and Loose Coupling
+
+- [ ] T072 Write the component boundary rules from plan.md into a short doc under docs/ and check that the doc matches the dependency rules
+- [ ] T073 Add a migration for an append-only run_events table (run_id, seq, kind, detail, created_at) in crates/overseer-store/migrations, with store functions append_event and list_events_since
+- [ ] T074 Emit run events from the runner, review and landing code through the store functions, for step start, tool call, verdict, and landing outcome
+- [ ] T075 Add overseer events with --run, --follow and --json flags that print one JSON object per line and follow the log like tail -f
+- [ ] T076 Add overseer ps with a --json flag that lists running tasks with profile, step count and elapsed time
+- [ ] T077 Check the prompt size against the profile context limit before a run is sent, and fail with a clear message instead of an HTTP 400 from the server
+- [ ] T078 Bound the reviewer context by a token budget tied to the review profile, so changed-file contents cannot overflow the reviewer's context
+- [ ] T079 Add an overseer-web binary that serves read-only JSON from the store, with no dependency on overseer-orchestrator
+- [ ] T080 Add a single static HTML page that polls the overseer-web JSON endpoints, with no build step
+- [ ] T081 Add a CI check that fails if overseer-web or a monitoring command depends on overseer-orchestrator (cargo tree or cargo metadata)
+- [ ] T082 Mark the phase 7 HTTP API task (T063) as superseded by T079 in the spec, once T079 is merged
+
