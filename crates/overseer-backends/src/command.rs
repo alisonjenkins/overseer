@@ -170,6 +170,8 @@ mod tests {
             fallback: Vec::new(),
             permissions: Permissions::WriteWorkdir,
             timeout_secs,
+            metered: false,
+            permission_args: Default::default(),
         }
     }
 

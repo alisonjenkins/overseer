@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,22 @@ pub struct Profile {
     pub permissions: Permissions,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// True when runs on this profile spend paid credits. `credits_low` mode
+    /// skips metered profiles when routing.
+    #[serde(default)]
+    pub metered: bool,
+    /// Extra argv for a `command` backend, appended before the prompt for each
+    /// effective permission level. A level with no entry adds nothing.
+    #[serde(default)]
+    pub permission_args: BTreeMap<Permissions, Vec<String>>,
+}
+
+impl Profile {
+    /// The level a run gets when it asks for `requested`: the lower of the
+    /// request and this profile's ceiling.
+    pub fn effective_permissions(&self, requested: Permissions) -> Permissions {
+        requested.min(self.permissions)
+    }
 }
 
 fn default_permissions() -> Permissions {
@@ -96,6 +112,8 @@ impl Config {
                 fallback: Vec::new(),
                 permissions: Permissions::WriteWorkdir,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
+                metered: false,
+                permission_args: BTreeMap::new(),
             }],
         }
     }
@@ -407,6 +425,125 @@ command = []
         let text = config.to_toml_string().unwrap();
         assert!(text.contains("default_profile = \"local\""), "{text}");
         assert_eq!(Config::from_toml_str(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn effective_permissions_is_the_lower_of_request_and_ceiling() {
+        let mut profile = Config::from_toml_str(MINIMAL)
+            .unwrap()
+            .profile("local")
+            .unwrap()
+            .clone();
+        let cases = [
+            (Permissions::Read, Permissions::Read, Permissions::Read),
+            (
+                Permissions::WriteShell,
+                Permissions::Read,
+                Permissions::Read,
+            ),
+            (
+                Permissions::WriteShell,
+                Permissions::WriteWorkdir,
+                Permissions::WriteWorkdir,
+            ),
+            (
+                Permissions::WriteWorkdir,
+                Permissions::WriteShell,
+                Permissions::WriteWorkdir,
+            ),
+            (
+                Permissions::WriteShell,
+                Permissions::WriteShell,
+                Permissions::WriteShell,
+            ),
+        ];
+        for (requested, ceiling, expected) in cases {
+            profile.permissions = ceiling;
+            assert_eq!(
+                profile.effective_permissions(requested),
+                expected,
+                "requested {requested} under ceiling {ceiling}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_configs_default_to_unmetered_with_no_permission_args() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        let profile = config.profile("local").unwrap();
+        assert!(!profile.metered);
+        assert!(profile.permission_args.is_empty());
+    }
+
+    #[test]
+    fn metered_and_permission_args_parse_per_level() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "claude"
+
+[[profiles]]
+name = "claude"
+backend = "command"
+command = ["claude", "-p"]
+metered = true
+permissions = "write-shell"
+
+[profiles.permission_args]
+read = ["--permission-mode", "plan"]
+write-workdir = ["--permission-mode", "acceptEdits"]
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("claude").unwrap();
+        assert!(profile.metered);
+        assert_eq!(
+            profile.permission_args.get(&Permissions::Read),
+            Some(&vec!["--permission-mode".to_owned(), "plan".to_owned()])
+        );
+        assert_eq!(profile.permission_args.get(&Permissions::WriteShell), None);
+    }
+
+    #[test]
+    fn unknown_permission_arg_level_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["true"]
+
+[profiles.permission_args]
+write_shell = ["--yes"]
+"#;
+        assert!(matches!(parse_err(text), CoreError::ConfigParse { .. }));
+    }
+
+    #[test]
+    fn cycles_and_unknown_names_are_still_rejected_with_new_fields() {
+        let cyclic = r#"
+repo = "/work/project"
+default_profile = "a"
+
+[[profiles]]
+name = "a"
+backend = "command"
+command = ["true"]
+metered = true
+fallback = ["b"]
+
+[[profiles]]
+name = "b"
+backend = "command"
+command = ["true"]
+fallback = ["a"]
+"#;
+        assert!(matches!(parse_err(cyclic), CoreError::FallbackCycle { .. }));
+        let dangling = cyclic.replace("fallback = [\"a\"]", "fallback = [\"zz\"]");
+        assert!(matches!(
+            parse_err(&dangling),
+            CoreError::UnknownFallback { .. }
+        ));
     }
 
     #[test]
