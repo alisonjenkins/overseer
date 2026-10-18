@@ -120,14 +120,32 @@ pub async fn run_worker(
             }
             Some(task) => {
                 let summary = run_task(store, config, state_dir, task.id).await?;
-                println!(
-                    "task {} {}: {} ({}, {} attempt(s))",
-                    task.id,
-                    task.title,
-                    summary.status.as_str(),
-                    summary.profile,
-                    summary.attempts.len()
-                );
+                if summary.status == TaskStatus::NeedsHuman {
+                    if let Some(ref reason) = summary.reason {
+                        if let Some(esc) = reason.strip_prefix("escalation: ") {
+                            let paths: Vec<&str> = esc.split(", ").take(3).collect();
+                            println!(
+                                "task {} {}: needs-human (escalation: {})",
+                                task.id,
+                                task.title,
+                                paths.join(", ")
+                            );
+                        } else {
+                            println!("task {} {}: needs-human ({})", task.id, task.title, reason);
+                        }
+                    } else {
+                        println!("task {} {}: needs-human", task.id, task.title);
+                    }
+                } else {
+                    println!(
+                        "task {} {}: {} ({}, {} attempt(s))",
+                        task.id,
+                        task.title,
+                        summary.status.as_str(),
+                        summary.profile,
+                        summary.attempts.len()
+                    );
+                }
                 stats.tasks_executed = stats.tasks_executed.saturating_add(1);
                 let final_status =
                     if summary.status == TaskStatus::Review && !config.review.profiles.is_empty() {
@@ -584,5 +602,68 @@ mod tests {
             .join(format!("{}.diff", lessons[0].id));
         assert!(md_file.is_file());
         assert!(diff_file.is_file());
+    }
+
+    #[tokio::test]
+    async fn worker_escalates_sensitive_task_to_needs_human_and_does_not_retry() {
+        let mut fx = fixture();
+        let mut config = test_config(&fx.repo);
+        config.profiles.push(fake_command_profile(
+            "escalate",
+            "echo ok > Cargo.toml && echo done",
+        ));
+
+        let (_tx, shutdown) = shutdown_pair();
+
+        let t = fx
+            .store
+            .add_task(NewTask {
+                title: "touch cargo".to_owned(),
+                profile: Some("escalate".to_owned()),
+                ready: true,
+                priority: 1,
+                ..NewTask::default()
+            })
+            .unwrap();
+
+        let stats = run_worker(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            WorkerOptions {
+                once: true,
+                max_tasks: None,
+                poll_interval: Duration::from_millis(10),
+            },
+            shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.tasks_executed, 1);
+        assert_eq!(stats.tasks_blocked, 1);
+        assert_eq!(stats.tasks_succeeded, 0);
+
+        let task = fx.store.get_task(t.id).unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsHuman);
+        assert_eq!(task.reason.as_deref(), Some("escalation: Cargo.toml"));
+
+        // Running worker again finds no eligible tasks because needs-human is not ready
+        let (_tx2, shutdown2) = shutdown_pair();
+        let stats2 = run_worker(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            WorkerOptions {
+                once: true,
+                max_tasks: None,
+                poll_interval: Duration::from_millis(10),
+            },
+            shutdown2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats2.tasks_executed, 0);
     }
 }

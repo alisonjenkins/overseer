@@ -140,8 +140,8 @@ pub async fn diff_stat(repo: &Path, branch: &str) -> Result<String, WorktreeErro
     diff_internal(repo, branch, true).await
 }
 
-async fn diff_internal(repo: &Path, branch: &str, stat: bool) -> Result<String, WorktreeError> {
-    let base = match git(repo, &["merge-base", "HEAD", branch]).await {
+async fn base_commit(repo: &Path, branch: &str) -> String {
+    match git(repo, &["merge-base", "HEAD", branch]).await {
         Ok(output) if !output.trim().is_empty() => output.trim().to_owned(),
         _ => match git(
             repo,
@@ -156,7 +156,25 @@ async fn diff_internal(repo: &Path, branch: &str, stat: bool) -> Result<String, 
             Ok(output) if !output.trim().is_empty() => output.trim().to_owned(),
             _ => "HEAD".to_owned(),
         },
-    };
+    }
+}
+
+/// List changed file paths between the merge base and `branch`.
+pub async fn changed_paths(repo: &Path, branch: &str) -> Result<Vec<String>, WorktreeError> {
+    let base = base_commit(repo, branch).await;
+    let range = format!("{base}...{branch}");
+    let output = git(repo, &["diff", "--no-ext-diff", "--name-only", &range]).await?;
+    let paths = output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(paths)
+}
+
+async fn diff_internal(repo: &Path, branch: &str, stat: bool) -> Result<String, WorktreeError> {
+    let base = base_commit(repo, branch).await;
     let range = format!("{base}...{branch}");
     let mut args = vec!["diff", "--no-ext-diff"];
     if stat {
@@ -817,5 +835,28 @@ mod tests {
         assert!(!worktree.path.exists());
         let branches = git_sync(&repo, &["branch", "--list", "overseer/task-5"]);
         assert!(branches.trim().is_empty(), "{branches}");
+    }
+
+    #[tokio::test]
+    async fn changed_paths_returns_files_changed_on_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(6)).await.unwrap();
+
+        std::fs::create_dir_all(worktree.path.join("src")).unwrap();
+        std::fs::write(worktree.path.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(worktree.path.join("Cargo.toml"), "# config\n").unwrap();
+        commit_all(&worktree.path, "add lib.rs and Cargo.toml")
+            .await
+            .unwrap();
+
+        let paths = changed_paths(&repo, &worktree.branch).await.unwrap();
+        assert_eq!(
+            paths,
+            vec!["Cargo.toml".to_owned(), "src/lib.rs".to_owned()]
+        );
     }
 }

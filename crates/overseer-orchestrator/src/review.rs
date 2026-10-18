@@ -707,7 +707,19 @@ pub async fn run_review_loop_with_backends(
                 .map_err(|source| ReviewError::Rework { source })?;
 
                 if summary.status != TaskStatus::Review {
-                    return Ok(TaskStatus::Blocked);
+                    if summary.status == TaskStatus::NeedsHuman
+                        && let Some(ref reason) = summary.reason
+                        && let Some(esc) = reason.strip_prefix("escalation: ")
+                    {
+                        let paths: Vec<&str> = esc.split(", ").take(3).collect();
+                        println!(
+                            "task {} {}: needs-human (escalation: {})",
+                            task.id,
+                            task.title,
+                            paths.join(", ")
+                        );
+                    }
+                    return Ok(summary.status);
                 }
 
                 store
@@ -1284,6 +1296,73 @@ mod tests {
         let task = fix.store.get_task(task_id).unwrap();
         assert!(!task.approved);
         assert_eq!(task.status, TaskStatus::NeedsHuman);
+    }
+
+    #[tokio::test]
+    async fn rework_touching_sensitive_paths_escalates_to_needs_human() {
+        let mut fix = fixture();
+        let task_id = add_task(&mut fix.store, "rework sensitive");
+
+        struct EscalatingWorker {
+            counter: AtomicUsize,
+        }
+        #[async_trait]
+        impl Backend for EscalatingWorker {
+            async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    std::fs::write(req.workdir.join("work.txt"), "normal content\n").unwrap();
+                } else {
+                    std::fs::write(req.workdir.join("Cargo.toml"), "# modified in rework\n")
+                        .unwrap();
+                }
+                Ok(RunOutcome {
+                    output: format!("round {n}"),
+                    usage: Usage::default(),
+                    failure: None,
+                })
+            }
+        }
+
+        let worker = EscalatingWorker {
+            counter: AtomicUsize::new(0),
+        };
+        let rev = SequentialReviewBackend::new(vec![
+            "VERDICT: CHANGES\n\n- Fix something".to_owned(),
+            "VERDICT: PASS\n\nShould not be called".to_owned(),
+        ]);
+
+        let mut backends: HashMap<&str, &dyn Backend> = HashMap::new();
+        backends.insert("local", &worker);
+        backends.insert("rev", &rev);
+
+        let config = Config {
+            repo: fix.repo.clone(),
+            default_profile: "local".to_owned(),
+            review: overseer_core::ReviewConfig {
+                profiles: vec!["rev".to_owned()],
+                max_reworks: 2,
+                rework_profile: None,
+            },
+            profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
+            escalation: Default::default(),
+        };
+
+        run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+            .await
+            .unwrap();
+
+        let status =
+            run_review_loop_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+                .await
+                .unwrap();
+
+        assert_eq!(status, TaskStatus::NeedsHuman);
+        let task = fix.store.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsHuman);
+        assert_eq!(task.reason.as_deref(), Some("escalation: Cargo.toml"));
+        assert_eq!(rev.responses.lock().unwrap().len(), 1);
     }
 
     #[test]

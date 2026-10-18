@@ -41,6 +41,13 @@ pub enum RunnerError {
     #[error("task {task_id} finished without a single attempt")]
     NoAttempt { task_id: TaskId },
 
+    #[error("failed to get changed paths for branch {branch:?}")]
+    ChangedPaths {
+        branch: String,
+        #[source]
+        source: crate::worktree::WorktreeError,
+    },
+
     /// One variant for every store call; `step` names the call that failed.
     #[error("store step {step} failed")]
     Store {
@@ -71,6 +78,7 @@ pub struct RunSummary {
     pub task_id: TaskId,
     pub profile: String,
     pub status: TaskStatus,
+    pub reason: Option<String>,
     pub failure: Option<FailureKind>,
     pub branch: String,
     pub commit: Option<String>,
@@ -491,13 +499,30 @@ async fn execute(
     let Some(last) = attempts.last().cloned() else {
         return Err(RunnerError::NoAttempt { task_id });
     };
-    let task_status = if last.failure.is_none() {
-        TaskStatus::Review
+    let (task_status, reason) = if last.failure.is_none() {
+        let changed = worktree::changed_paths(&config.repo, &branch)
+            .await
+            .map_err(|source| RunnerError::ChangedPaths {
+                branch: branch.clone(),
+                source,
+            })?;
+        let hits = crate::escalation::escalation_hits(&changed, &config.escalation);
+        if hits.is_empty() {
+            (TaskStatus::Review, None)
+        } else {
+            (
+                TaskStatus::NeedsHuman,
+                Some(format!("escalation: {}", hits.join(", "))),
+            )
+        }
     } else {
-        TaskStatus::Blocked
+        (
+            TaskStatus::Blocked,
+            last.failure.as_ref().map(ToString::to_string),
+        )
     };
     store
-        .set_status(task_id, task_status)
+        .set_status_with_reason(task_id, task_status, reason.as_deref())
         .map_err(store_step("set task status"))?;
 
     Ok(RunSummary {
@@ -505,6 +530,7 @@ async fn execute(
         task_id,
         profile: last.profile,
         status: task_status,
+        reason,
         failure: last.failure,
         branch,
         commit,
@@ -1306,5 +1332,86 @@ mod tests {
 
         assert_eq!(summary.status, TaskStatus::Review);
         assert_eq!(*gemini.leftovers.lock().unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn successful_run_touching_sensitive_paths_escalates_to_needs_human() {
+        let mut fx = fixture();
+        let config = config(&fx.repo);
+        let task = add(&mut fx.store, "touch Cargo.toml", "modify dependency");
+        let backend = WritingBackend {
+            file: "Cargo.toml",
+            content: "# sensitive\n",
+        };
+
+        let summary = run_task_with_backend(&mut fx.store, &config, &fx.state, task, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::NeedsHuman);
+        assert_eq!(summary.reason.as_deref(), Some("escalation: Cargo.toml"));
+        let stored = fx.store.get_task(task).unwrap();
+        assert_eq!(stored.status, TaskStatus::NeedsHuman);
+        assert_eq!(stored.reason.as_deref(), Some("escalation: Cargo.toml"));
+    }
+
+    #[tokio::test]
+    async fn blocked_run_records_failure_reason() {
+        let mut fx = fixture();
+        let config = config(&fx.repo);
+        let task = add(&mut fx.store, "failing task", "");
+        let backend = MockBackend::new(vec![Ok(RunOutcome {
+            output: String::new(),
+            usage: Usage::default(),
+            failure: Some(FailureKind::Other("disk full".to_owned())),
+        })]);
+
+        let summary = run_task_with_backend(&mut fx.store, &config, &fx.state, task, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Blocked);
+        assert_eq!(summary.reason.as_deref(), Some("other: disk full"));
+        let stored = fx.store.get_task(task).unwrap();
+        assert_eq!(stored.status, TaskStatus::Blocked);
+        assert_eq!(stored.reason.as_deref(), Some("other: disk full"));
+    }
+
+    #[tokio::test]
+    async fn continue_task_touching_sensitive_paths_escalates_to_needs_human() {
+        let mut fx = fixture();
+        let config = config(&fx.repo);
+        let task = add(&mut fx.store, "feature", "build it");
+        let backend1 = WritingBackend {
+            file: "out.txt",
+            content: "version 1\n",
+        };
+
+        let summary1 = run_task_with_backend(&mut fx.store, &config, &fx.state, task, &backend1)
+            .await
+            .unwrap();
+        assert_eq!(summary1.status, TaskStatus::Review);
+
+        let backend2 = WritingBackend {
+            file: "Cargo.toml",
+            content: "# sensitive\n",
+        };
+        let summary2 = continue_task_with_backend(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            task,
+            None,
+            "Rework: touch sensitive file",
+            &backend2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary2.status, TaskStatus::NeedsHuman);
+        assert_eq!(summary2.reason.as_deref(), Some("escalation: Cargo.toml"));
+        let stored = fx.store.get_task(task).unwrap();
+        assert_eq!(stored.status, TaskStatus::NeedsHuman);
+        assert_eq!(stored.reason.as_deref(), Some("escalation: Cargo.toml"));
     }
 }
