@@ -181,6 +181,8 @@ mod tests {
             skills: Vec::new(),
             gpu: false,
             context_chars: 48000,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 

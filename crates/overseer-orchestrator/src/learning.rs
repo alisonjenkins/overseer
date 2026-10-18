@@ -413,6 +413,8 @@ mod tests {
                 skills: Vec::new(),
                 gpu: false,
                 context_chars: 48000,
+                input_tokens: 0,
+                output_tokens: 0,
             }],
             learning: LearningConfig {
                 profile: Some("agent".to_owned()),

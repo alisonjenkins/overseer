@@ -296,7 +296,7 @@ impl Backend for OpenAiBackend {
             let body = self.request_body(req);
             let resp_text = match self.send_chat_request(&body).await {
                 Ok(text) => text,
-                Err(kind) => return Ok(failed(kind)),
+                Err(kind) => return Ok(failed(kind, overseer_core::Usage::default())),
             };
             return Ok(parse_completion(&resp_text));
         }
@@ -309,19 +309,23 @@ fn parse_completion(body: &str) -> RunOutcome {
     let value: Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(_) => {
-            return failed(FailureKind::Other(format!(
-                "response is not JSON: {}",
-                tail(body, BODY_EXCERPT_CHARS)
-            )));
+            return failed(
+                FailureKind::Other(format!(
+                    "response is not JSON: {}",
+                    tail(body, BODY_EXCERPT_CHARS)
+                )),
+                overseer_core::Usage::default(),
+            );
         }
     };
     let Some(content) = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
     else {
-        return failed(FailureKind::Other(
-            "response has no choices[0].message.content".to_owned(),
-        ));
+        return failed(
+            FailureKind::Other("response has no choices[0].message.content".to_owned()),
+            overseer_core::Usage::default(),
+        );
     };
     let usage = Usage {
         input_tokens: value
@@ -430,6 +434,8 @@ mod tests {
             skills: Vec::new(),
             gpu: false,
             context_chars: 48000,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -673,6 +679,8 @@ mod tests {
             skills: Vec::new(),
             gpu: false,
             context_chars: 48000,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 

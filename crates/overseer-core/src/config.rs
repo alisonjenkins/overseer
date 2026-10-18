@@ -240,6 +240,12 @@ pub struct Profile {
     /// Character budget for conversation history in the agent tool loop.
     #[serde(default = "default_context_chars")]
     pub context_chars: u32,
+    /// Number of input tokens consumed by this profile's run.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Number of output tokens produced by this profile's run.
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 impl Profile {
@@ -247,6 +253,14 @@ impl Profile {
     /// request and this profile's ceiling.
     pub fn effective_permissions(&self, requested: Permissions) -> Permissions {
         requested.min(self.permissions)
+    }
+
+    /// Token usage reported by this profile's run.
+    pub fn get_usage(&self) -> crate::Usage {
+        crate::Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        }
     }
 }
 

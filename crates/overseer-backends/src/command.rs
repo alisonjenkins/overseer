@@ -41,7 +41,7 @@ const QUOTA_PHRASES: [&str; 8] = [
 /// The prompt is appended as the final argument, or written to stdin when the
 /// profile sets `prompt_stdin`. A system prompt, if any, is prepended to the
 /// prompt text because a bare argv has no separate system channel. Usage is
-/// not reported by commands and is always zero.
+/// reported from the profile's token counts.
 pub struct CommandBackend {
     profile_name: String,
     program: String,
@@ -52,6 +52,7 @@ pub struct CommandBackend {
     ceiling: Permissions,
     permission_args: BTreeMap<Permissions, Vec<String>>,
     env: BTreeMap<String, String>,
+    usage: Usage,
 }
 
 impl CommandBackend {
@@ -75,6 +76,7 @@ impl CommandBackend {
             ceiling: profile.permissions,
             permission_args: profile.permission_args.clone(),
             env: profile.env.clone(),
+            usage: profile.get_usage(),
         })
     }
 }
@@ -150,7 +152,7 @@ impl Backend for CommandBackend {
                             error = %source,
                             "command backend could not start its program"
                         );
-                        return Ok(failed(FailureKind::Unreachable));
+                        return Ok(failed(FailureKind::Unreachable, self.usage));
                     }
                 }
             }
@@ -174,20 +176,21 @@ impl Backend for CommandBackend {
         match tokio::time::timeout(self.timeout, collect).await {
             Err(_elapsed) => {
                 tracing::warn!(profile = %self.profile_name, "command backend timed out");
-                Ok(failed(FailureKind::Other(format!(
-                    "timed out after {}s",
-                    self.timeout.as_secs()
-                ))))
+                Ok(failed(
+                    FailureKind::Other(format!("timed out after {}s", self.timeout.as_secs())),
+                    self.usage,
+                ))
             }
-            Ok(Err(source)) => Ok(failed(FailureKind::Other(format!(
-                "failed to wait for command: {source}"
-            )))),
-            Ok(Ok(output)) => Ok(classify(&output)),
+            Ok(Err(source)) => Ok(failed(
+                FailureKind::Other(format!("failed to wait for command: {source}")),
+                self.usage,
+            )),
+            Ok(Ok(output)) => Ok(classify(&output, &self.usage)),
         }
     }
 }
 
-fn classify(output: &std::process::Output) -> RunOutcome {
+fn classify(output: &std::process::Output, usage: &Usage) -> RunOutcome {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let failure = if output.status.success() && !stdout.trim().is_empty() {
@@ -197,7 +200,7 @@ fn classify(output: &std::process::Output) -> RunOutcome {
     };
     RunOutcome {
         output: stdout,
-        usage: Usage::default(),
+        usage: *usage,
         failure,
     }
 }
@@ -276,6 +279,8 @@ mod tests {
             skills: Vec::new(),
             gpu: false,
             context_chars: 48000,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 

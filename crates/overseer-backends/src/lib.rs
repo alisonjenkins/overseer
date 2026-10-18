@@ -35,10 +35,10 @@ pub fn build_backend(profile: &Profile) -> Result<Box<dyn Backend>, BackendError
 }
 
 /// Outcome for a run that failed before producing any output.
-fn failed(kind: FailureKind) -> RunOutcome {
+fn failed(kind: FailureKind, usage: overseer_core::Usage) -> RunOutcome {
     RunOutcome {
         output: String::new(),
-        usage: overseer_core::Usage::default(),
+        usage,
         failure: Some(kind),
     }
 }
