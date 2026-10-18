@@ -100,11 +100,19 @@ profile's `permissions` ceiling.
 installed version before relying on them; the test suite does not run them.
 
 - `local`: the default profile, an `openai` server on `127.0.0.1:8080`.
-- `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with `agy` flags for each
-  permission level. Falls back to `local`.
+- `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with
+  `permissions = "write-shell"` (`--dangerously-skip-permissions`). Falls back
+  to `local`.
 - `claude`: `claude -p`, `metered = true`, with `--permission-mode` flags.
   Falls back to `gemini`, then `local`.
 - `opencode-local`: `opencode run`. Untested example, not in any fallback chain.
+
+The starter `gemini` profile sets its ceiling to `write-shell` because headless
+`agy` (`-p`) requires the "command" permission to inspect the directory. Under
+`--mode accept-edits`, headless mode auto-denies that permission, exits 0 with
+empty output, and creates no files. Passing `--dangerously-skip-permissions`
+allows it to edit files, which is safe because runs take place in an isolated
+task worktree.
 
 The starter keeps `default_profile = "local"`. To try `claude` first, set
 `default_profile = "claude"`; the chain then covers it when it cannot run.
