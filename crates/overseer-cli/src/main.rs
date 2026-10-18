@@ -14,7 +14,12 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             eprintln!("overseer: {err:#}");
-            ExitCode::FAILURE
+            match err {
+                commands::CliError::Refusal(_) | commands::CliError::MergeConflict(_) => {
+                    ExitCode::from(2)
+                }
+                commands::CliError::Other(_) => ExitCode::FAILURE,
+            }
         }
     }
 }

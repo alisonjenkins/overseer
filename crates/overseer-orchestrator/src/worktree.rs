@@ -328,6 +328,20 @@ async fn base_branch_for(repo: &Path, branch: &str) -> Option<String> {
         }
     }
 
+    let checkout_target = format!(" to {branch}");
+    if let Ok(head_reflog) = git(repo, &["reflog", "show", "--format=%gs", "HEAD"]).await {
+        for line in head_reflog.lines() {
+            if let Some(rest) = line.strip_prefix("checkout: moving from ")
+                && let Some((source, _)) = rest.split_once(&checkout_target)
+            {
+                let trimmed = source.trim();
+                if !trimmed.is_empty() && trimmed != "HEAD" {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+    }
+
     if let Ok(reflog) = git(repo, &["reflog", "show", "--format=%gs", branch]).await {
         for line in reflog.lines() {
             if let Some(rest) = line.strip_prefix("branch: Created from ") {
@@ -354,6 +368,13 @@ async fn base_branch_for(repo: &Path, branch: &str) -> Option<String> {
             && let Some(b) = branches.first()
         {
             return Some((*b).to_owned());
+        }
+
+        if branches.contains(&"main") {
+            return Some("main".to_owned());
+        }
+        if branches.contains(&"master") {
+            return Some("master".to_owned());
         }
 
         let mut best_branch = None;

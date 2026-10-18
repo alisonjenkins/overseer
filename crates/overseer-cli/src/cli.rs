@@ -37,6 +37,24 @@ pub enum Command {
         /// Id of the task whose runs to list.
         task_id: i64,
     },
+    /// Print the diff of a task branch against its base.
+    Diff {
+        /// Id of the task to diff.
+        id: i64,
+        /// Show diffstat instead of full diff.
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Merge a reviewed task branch into the current branch.
+    Merge {
+        /// Id of the task to merge.
+        id: i64,
+    },
+    /// Discard a task's worktree and branch, returning it to backlog.
+    Discard {
+        /// Id of the task to discard.
+        id: i64,
+    },
     /// Show or change the routing mode.
     #[command(subcommand)]
     Mode(ModeCommand),

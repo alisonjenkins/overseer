@@ -12,7 +12,38 @@ use crate::state;
 /// from an overseer error (exit 1).
 const EXIT_BLOCKED: u8 = 2;
 
-pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<ExitCode> {
+#[derive(Debug)]
+pub enum CliError {
+    Refusal(String),
+    MergeConflict(String),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refusal(msg) | Self::MergeConflict(msg) => write!(f, "{msg}"),
+            Self::Other(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(err) => err.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for CliError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(err)
+    }
+}
+
+pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<ExitCode, CliError> {
     let dir = state::resolve_state_dir(state_dir)?;
     match command {
         Command::Init { repo } => {
@@ -32,11 +63,138 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Task(task) => run_task(&dir, task).map(|()| ExitCode::SUCCESS),
-        Command::Run { id } => run_one(&dir, id),
-        Command::Runs { task_id } => list_runs(&dir, task_id).map(|()| ExitCode::SUCCESS),
-        Command::Mode(mode) => run_mode(&dir, mode).map(|()| ExitCode::SUCCESS),
+        Command::Task(task) => {
+            run_task(&dir, task)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Run { id } => run_one(&dir, id).map_err(CliError::from),
+        Command::Runs { task_id } => {
+            list_runs(&dir, task_id)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Diff { id, stat } => run_diff(&dir, id, stat),
+        Command::Merge { id } => run_merge(&dir, id),
+        Command::Discard { id } => run_discard(&dir, id),
+        Command::Mode(mode) => {
+            run_mode(&dir, mode)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+fn run_diff(dir: &Path, id: i64, stat: bool) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let _task = store
+        .get_task(task_id)
+        .with_context(|| format!("failed to find task {id}"))?;
+    let branch = overseer_orchestrator::branch_name(task_id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let output = if stat {
+        runtime.block_on(overseer_orchestrator::diff_stat(&config.repo, &branch))
+    } else {
+        runtime.block_on(overseer_orchestrator::diff(&config.repo, &branch))
+    }
+    .with_context(|| format!("failed to diff task {id}"))?;
+    print!("{output}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_merge(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let task = store
+        .get_task(task_id)
+        .with_context(|| format!("failed to find task {id}"))?;
+    if task.status != TaskStatus::Review {
+        return Err(CliError::Refusal(format!(
+            "task {id} has status {}; only tasks in review can be merged",
+            task.status
+        )));
+    }
+    let branch = overseer_orchestrator::branch_name(task_id);
+    let wt_path = overseer_orchestrator::worktree_path(dir, task_id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let sha = match runtime.block_on(overseer_orchestrator::merge(
+        &config.repo,
+        Some(&wt_path),
+        &branch,
+        task_id,
+        &task.title,
+    )) {
+        Ok(sha) => sha,
+        Err(overseer_orchestrator::MergeError::WorkingTreeDirty) => {
+            return Err(CliError::Refusal(
+                "repository working tree is not clean; commit or stash changes before merging"
+                    .to_owned(),
+            ));
+        }
+        Err(overseer_orchestrator::MergeError::WrongBranch {
+            task_id,
+            current,
+            expected,
+        }) => {
+            return Err(CliError::Refusal(format!(
+                "current branch is {current:?}, but task {task_id} branched from {expected:?}; switch to {expected:?} before merging"
+            )));
+        }
+        Err(overseer_orchestrator::MergeError::MergeConflict { paths }) => {
+            return Err(CliError::MergeConflict(format!(
+                "merge conflict in {}",
+                paths.join(", ")
+            )));
+        }
+        Err(err) => {
+            return Err(CliError::Other(
+                anyhow::Error::from(err).context(format!("failed to merge task {id}")),
+            ));
+        }
+    };
+    store
+        .set_status(task_id, TaskStatus::Done)
+        .context("failed to set task status to done")?;
+    println!("{sha}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_discard(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let task = store
+        .get_task(task_id)
+        .with_context(|| format!("failed to find task {id}"))?;
+    if task.status != TaskStatus::Review && task.status != TaskStatus::Blocked {
+        return Err(CliError::Refusal(format!(
+            "task {id} has status {}; only tasks in review or blocked can be discarded",
+            task.status
+        )));
+    }
+    let branch = overseer_orchestrator::branch_name(task_id);
+    let wt_path = overseer_orchestrator::worktree_path(dir, task_id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    runtime
+        .block_on(overseer_orchestrator::discard(
+            &config.repo,
+            Some(&wt_path),
+            &branch,
+        ))
+        .with_context(|| format!("failed to discard task {id}"))?;
+    store
+        .set_status(task_id, TaskStatus::Backlog)
+        .context("failed to reset task status to backlog")?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_one(dir: &Path, id: i64) -> Result<ExitCode> {
