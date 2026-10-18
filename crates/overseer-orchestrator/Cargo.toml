@@ -14,7 +14,7 @@ overseer-backends = { version = "0.1.0", path = "../overseer-backends" }
 overseer-core = { version = "0.1.0", path = "../overseer-core" }
 overseer-store = { version = "0.1.0", path = "../overseer-store" }
 thiserror = "2"
-tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt"] }
+tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
