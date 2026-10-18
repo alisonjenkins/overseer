@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::Permissions;
+use crate::{Permissions, TaskId};
 
 /// Everything a backend needs to execute one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +58,90 @@ pub struct RunOutcome {
     pub failure: Option<FailureKind>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RunId(i64);
+
+impl RunId {
+    pub const fn new(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Lifecycle of one run row. A run is `Running` from claim until it is
+/// finished as `Succeeded` or `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl RunStatus {
+    pub const ALL: [Self; 3] = [Self::Running, Self::Succeeded, Self::Failed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_db_text(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|status| status.as_str() == text)
+    }
+}
+
+/// A stored run, as read back from the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub id: RunId,
+    pub task_id: TaskId,
+    pub profile: String,
+    pub status: RunStatus,
+    /// ISO8601 UTC.
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub usage: Usage,
+    pub failure: Option<String>,
+    pub transcript_path: Option<PathBuf>,
+    pub branch: Option<String>,
+}
+
+/// Values written when a run finishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFinish {
+    /// Must be `Succeeded` or `Failed`.
+    pub status: RunStatus,
+    pub usage: Usage,
+    pub failure: Option<String>,
+    pub transcript_path: Option<PathBuf>,
+    pub branch: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn run_status_strings_round_trip() {
+        for status in RunStatus::ALL {
+            assert_eq!(RunStatus::from_db_text(status.as_str()), Some(status));
+        }
+        assert_eq!(RunStatus::from_db_text("queued"), None);
+    }
 
     #[test]
     fn only_quota_auth_and_unreachable_are_routable() {

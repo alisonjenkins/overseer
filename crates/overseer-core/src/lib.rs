@@ -8,7 +8,7 @@ mod task;
 
 pub use config::{BackendKind, Config, Profile};
 pub use permissions::Permissions;
-pub use run::{FailureKind, RunOutcome, RunRequest, Usage};
+pub use run::{FailureKind, Run, RunFinish, RunId, RunOutcome, RunRequest, RunStatus, Usage};
 pub use status::TaskStatus;
 pub use task::{NewTask, Task, TaskId};
 
