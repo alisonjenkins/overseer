@@ -170,6 +170,9 @@ impl Store {
         Ok(task)
     }
 
+    /// List all tasks, optionally filtered by status.
+    ///
+    /// Returns tasks ordered by priority ascending, then by id ascending.
     pub fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<Task>, StoreError> {
         let status_text = status.map(TaskStatus::as_str);
         let list_err = |source| StoreError::ListTasks { source };
