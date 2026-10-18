@@ -4,10 +4,11 @@ Overseer is a single-user, local-first task orchestrator. It keeps a queue of
 software tasks in SQLite and is meant to hand them to whichever model backend
 is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
-lists the milestones. This repository currently implements M3: the task store,
+lists the milestones. This repository currently implements M4: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
-credits-low mode, and the `overseer` CLI for `init`, `task`, `run`, `runs`,
-`mode`, `diff`, `merge` and `discard`.
+credits-low mode, the worker queue drainer with single-worker locking and crash
+recovery, and the `overseer` CLI for `init`, `task`, `run`, `runs`, `worker`,
+`status`, `mode`, `diff`, `merge` and `discard`.
 
 ## Installation
 
@@ -59,10 +60,11 @@ nix develop -c cargo fmt --check
 
 ```sh
 overseer init
-overseer task add "write parser" --body "handle quotes" --priority 2
+overseer task add "write parser" --body "handle quotes" --priority 2 --ready
 overseer task add "write tests" --priority 1 --depends-on 1
-overseer task list --status backlog
-overseer task show 2
+overseer task ready 2
+overseer status
+overseer worker --once
 ```
 
 The state directory is chosen in this order: `--state-dir <DIR>`, the
@@ -120,6 +122,100 @@ overseer discard 1
 - `overseer discard <id>` removes the task worktree and branch (`git branch -D`)
   and resets the task status to `backlog`. It refuses unless the task status is
   `review` or `blocked`.
+
+## Draining the queue with the worker
+
+`overseer worker [--once] [--max-tasks N] [--poll-secs S]` drains eligible tasks
+from the queue one at a time, allowing you to queue tasks and walk away:
+
+```sh
+overseer task add "refactor parser" --ready
+overseer task add "write unit tests" --depends-on 1
+overseer worker
+```
+
+### Task eligibility and ordering
+
+Only tasks in `ready` status are run by the worker. Tasks in `backlog` are not run
+until marked ready:
+
+- `overseer task add <title> --ready`: creates a task directly in `ready` status.
+- `overseer task ready <id>`: transitions a task from `backlog` or `blocked` to `ready`.
+
+Among `ready` tasks, the worker picks the lowest `priority` value (most urgent),
+then lowest id, whose dependencies are ALL in `done` status. Tasks with unmet
+dependencies are skipped without failing.
+
+### Worker options
+
+- `--once`: drain any currently eligible ready tasks, exiting 0 as soon as none
+  remain.
+- `--max-tasks N`: stop after completing N task runs, then exit 0.
+- `--poll-secs S`: seconds to sleep when no eligible tasks are ready (default 5 s).
+  The sleep is interruptible by shutdown signals.
+
+The worker prints one line per completed task:
+
+```text
+task 1 refactor parser: review (local-edit, 1 attempt(s))
+```
+
+### Single worker lock
+
+The worker acquires an exclusive non-blocking lock on `<state-dir>/worker.lock`,
+writing its process PID into the file. If a second worker attempts to start while
+the lock is held, it exits immediately with exit code 3 and an explanatory message:
+
+```text
+overseer: another worker is already running (pid 12345)
+```
+
+The lock is released automatically when the worker exits or terminates.
+
+### Crash recovery
+
+When a worker starts and acquires the lock, it performs crash recovery before
+processing the queue: any task left in `running` status (from a previous worker
+that crashed or died) is moved to `blocked`, and its newest `running` run row is
+finished as failed with failure text `interrupted`.
+
+### Graceful shutdown
+
+- On `SIGINT` (Ctrl+C) or `SIGTERM`, the worker stops picking new tasks, prints
+  `stopping after current task`, and allows the currently executing task run to
+  finish normally. It then exits with code 0.
+- A second signal received during shutdown causes an immediate exit with code 130,
+  leaving the current task in `running` status. The next worker will recover it on
+  startup.
+
+### Queue and worker status
+
+`overseer status` prints an overview of the worker, mode, task status counts, and
+the 5 most recent runs:
+
+```sh
+overseer status
+```
+
+```text
+worker: not running
+credits-low: off
+
+TASKS
+STATUS        COUNT
+backlog           1
+ready             0
+running           0
+review            2
+blocked           0
+needs-human       0
+done              3
+
+RECENT RUNS
+   ID   TASK  PROFILE       STATUS            TOKENS
+    6      1  local-edit    succeeded         450/120
+    5      2  gemini        succeeded          890/45
+```
 
 ## Profiles
 
@@ -273,6 +369,10 @@ warning. The remaining metered profiles in that task's plan are then skipped.
   `blocked`, and `1` on an overseer error. It prints one line per attempt.
 - `overseer merge` and `overseer discard` exit `0` on success, `2` on refusal or
   merge conflict, and `1` on other errors.
+- `overseer worker` exits `0` on normal completion (including `--once` and
+  `--max-tasks`) or when cleanly stopped by a signal, `3` when another worker
+  holds the lock, `130` when terminated immediately by a second shutdown
+  signal, and `1` on an overseer error.
 
 ## Profile field reference
 
