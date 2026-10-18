@@ -443,6 +443,7 @@ impl Store {
         self.set_setting(CREDITS_LOW_KEY, if on { "true" } else { "false" })
     }
 
+    /// Record a review for a task.
     pub fn record_review(&mut self, new: NewReview) -> Result<ReviewRecord, StoreError> {
         let NewReview {
             task_id,
