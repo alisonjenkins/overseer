@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use overseer_core::{NewTask, Task, TaskId};
+use overseer_core::{Config, NewTask, Task, TaskId};
 
 use crate::cli::{Command, TaskCommand};
 use crate::state;
@@ -9,9 +9,21 @@ use crate::state;
 pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<()> {
     let dir = state::resolve_state_dir(state_dir)?;
     match command {
-        Command::Init => {
+        Command::Init { repo } => {
             state::create_store(&dir)?;
             println!("initialised overseer state at {}", dir.display());
+            let repo = match repo {
+                Some(path) => std::path::absolute(&path).with_context(|| {
+                    format!("cannot resolve repository path {}", path.display())
+                })?,
+                None => std::env::current_dir().context("cannot read the current directory")?,
+            };
+            let config_path = state::config_path(&dir);
+            if state::write_starter_config(&dir, &Config::starter(repo))? {
+                println!("wrote starter config {}", config_path.display());
+            } else {
+                println!("kept existing config {}", config_path.display());
+            }
             Ok(())
         }
         Command::Task(task) => run_task(&dir, task),

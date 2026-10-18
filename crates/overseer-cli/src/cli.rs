@@ -17,8 +17,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create the state directory and database.
-    Init,
+    /// Create the state directory, database and starter `overseer.toml`.
+    Init {
+        /// Repository that task worktrees are created from. Defaults to the
+        /// current directory.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
     /// Manage tasks.
     #[command(subcommand)]
     Task(TaskCommand),

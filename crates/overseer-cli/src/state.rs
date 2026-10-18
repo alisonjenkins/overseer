@@ -1,10 +1,14 @@
 use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use overseer_core::Config;
 use overseer_store::Store;
 
 const DB_FILE_NAME: &str = "overseer.db";
+const CONFIG_FILE_NAME: &str = "overseer.toml";
 
 pub fn resolve_state_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     match explicit {
@@ -45,6 +49,29 @@ fn db_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DB_FILE_NAME)
 }
 
+pub fn config_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(CONFIG_FILE_NAME)
+}
+
+/// Write `config` to `overseer.toml` only if no such file exists. Returns
+/// `false`, leaving the file untouched, when it already exists.
+pub fn write_starter_config(state_dir: &Path, config: &Config) -> Result<bool> {
+    let path = config_path(state_dir);
+    let text = config
+        .to_toml_string()
+        .context("failed to render the starter config")?;
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to create {}", path.display()));
+        }
+    };
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -73,5 +100,20 @@ mod tests {
     fn no_xdg_and_no_home_is_an_error() {
         let err = default_state_dir(None, None).unwrap_err();
         assert!(err.to_string().contains("--state-dir"), "{err}");
+    }
+
+    #[test]
+    fn starter_config_is_written_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::starter(PathBuf::from("/work/project"));
+
+        assert!(write_starter_config(dir.path(), &config).unwrap());
+        let written = std::fs::read_to_string(config_path(dir.path())).unwrap();
+        assert_eq!(Config::from_toml_str(&written).unwrap(), config);
+
+        std::fs::write(config_path(dir.path()), "# edited by hand\n").unwrap();
+        assert!(!write_starter_config(dir.path(), &config).unwrap());
+        let kept = std::fs::read_to_string(config_path(dir.path())).unwrap();
+        assert_eq!(kept, "# edited by hand\n");
     }
 }
