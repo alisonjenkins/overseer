@@ -84,6 +84,16 @@ pub enum StoreError {
     #[error("task {id} cannot be claimed while it is {status}")]
     TaskNotClaimable { id: TaskId, status: TaskStatus },
 
+    #[error("failed to mark task {id} ready")]
+    ReadyTask {
+        id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("task {id} cannot be marked ready while it is {status}; must be backlog or blocked")]
+    TaskNotReadyable { id: TaskId, status: TaskStatus },
+
     #[error("failed to record a run for task {task_id}")]
     InsertRun {
         task_id: TaskId,

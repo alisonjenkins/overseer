@@ -95,6 +95,14 @@ pub enum TaskCommand {
         /// config's default_profile.
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
+        /// Make the task ready immediately instead of leaving it in backlog.
+        #[arg(long)]
+        ready: bool,
+    },
+    /// Mark a backlog or blocked task as ready.
+    Ready {
+        /// Id of the task to mark ready.
+        id: i64,
     },
     /// List tasks, most urgent first.
     List {

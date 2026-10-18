@@ -61,13 +61,18 @@ impl Store {
             priority,
             profile,
             mut depends_on,
+            ready,
         } = new;
         depends_on.sort_unstable();
         depends_on.dedup();
         let created_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|source| StoreError::FormatTimestamp { source })?;
-        let status = TaskStatus::Backlog;
+        let status = if ready {
+            TaskStatus::Ready
+        } else {
+            TaskStatus::Backlog
+        };
 
         let tx = self
             .conn
@@ -205,6 +210,27 @@ impl Store {
             return Err(StoreError::UnknownTask { id });
         }
         Ok(())
+    }
+
+    /// Atomically move a `backlog` or `blocked` task to `ready`. Any other
+    /// status is an error.
+    pub fn ready_task(&mut self, id: TaskId) -> Result<Task, StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'ready' \
+                 WHERE id = ?1 AND status IN ('backlog', 'blocked')",
+                params![id.get()],
+            )
+            .map_err(|source| StoreError::ReadyTask { id, source })?;
+        if changed == 1 {
+            return self.get_task(id);
+        }
+        let current = self.get_task(id)?;
+        Err(StoreError::TaskNotReadyable {
+            id,
+            status: current.status,
+        })
     }
 
     /// Atomically move a `backlog` or `ready` task to `running`. Any other
@@ -457,6 +483,7 @@ mod tests {
                 priority: 3,
                 profile: Some("local".to_owned()),
                 depends_on: Vec::new(),
+                ready: false,
             })
             .unwrap();
 
@@ -655,6 +682,65 @@ mod tests {
             ),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn ready_task_accepts_backlog_and_blocked_and_rejects_others() {
+        let mut store = memory_store();
+        // Backlog -> Ready
+        let t1 = store.add_task(new_task("t1", 0)).unwrap();
+        assert_eq!(t1.status, TaskStatus::Backlog);
+        let readied = store.ready_task(t1.id).unwrap();
+        assert_eq!(readied.status, TaskStatus::Ready);
+
+        // Already Ready -> Error
+        let err = store.ready_task(t1.id).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::TaskNotReadyable {
+                status: TaskStatus::Ready,
+                ..
+            }
+        ));
+
+        // Blocked -> Ready
+        store.set_status(t1.id, TaskStatus::Blocked).unwrap();
+        let readied = store.ready_task(t1.id).unwrap();
+        assert_eq!(readied.status, TaskStatus::Ready);
+
+        // Running -> Error
+        store.set_status(t1.id, TaskStatus::Running).unwrap();
+        let err = store.ready_task(t1.id).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::TaskNotReadyable {
+                status: TaskStatus::Running,
+                ..
+            }
+        ));
+
+        // Done -> Error
+        store.set_status(t1.id, TaskStatus::Done).unwrap();
+        let err = store.ready_task(t1.id).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::TaskNotReadyable {
+                status: TaskStatus::Done,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_task_with_ready_true_sets_status_ready() {
+        let mut store = memory_store();
+        let task = store
+            .add_task(NewTask {
+                ready: true,
+                ..new_task("ready task", 0)
+            })
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Ready);
     }
 
     #[test]

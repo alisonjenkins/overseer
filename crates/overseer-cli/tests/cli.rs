@@ -110,3 +110,38 @@ fn stderr_of_failure(state_dir: &Path, args: &[&str]) -> String {
         .clone();
     String::from_utf8(output).unwrap()
 }
+
+#[test]
+fn task_add_with_ready_flag_creates_ready_task() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    overseer(&state).arg("init").assert().success();
+
+    let id = stdout_of(&state, &["task", "add", "fast task", "--ready"]);
+    assert_eq!(id.trim(), "1");
+
+    let shown = stdout_of(&state, &["task", "show", "1"]);
+    assert!(shown.contains("status: ready"), "{shown}");
+}
+
+#[test]
+fn task_ready_moves_backlog_and_blocked_to_ready() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    overseer(&state).arg("init").assert().success();
+
+    let id = stdout_of(&state, &["task", "add", "my task"]);
+    assert_eq!(id.trim(), "1");
+    let shown = stdout_of(&state, &["task", "show", "1"]);
+    assert!(shown.contains("status: backlog"), "{shown}");
+
+    let out = stdout_of(&state, &["task", "ready", "1"]);
+    assert!(out.contains("task 1 ready"), "{out}");
+
+    let shown = stdout_of(&state, &["task", "show", "1"]);
+    assert!(shown.contains("status: ready"), "{shown}");
+
+    // Marking already ready task fails
+    let err = stderr_of_failure(&state, &["task", "ready", "1"]);
+    assert!(err.contains("cannot be marked ready"), "{err}");
+}

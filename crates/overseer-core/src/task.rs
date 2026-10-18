@@ -27,6 +27,7 @@ pub struct NewTask {
     pub priority: i32,
     pub profile: Option<String>,
     pub depends_on: Vec<TaskId>,
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

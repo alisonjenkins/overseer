@@ -304,6 +304,7 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
             priority,
             depends_on,
             profile,
+            ready,
         } => {
             if let Some(name) = profile.as_deref() {
                 let config = state::load_config(dir)?;
@@ -321,10 +322,18 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
                     priority,
                     profile,
                     depends_on: depends_on.into_iter().map(TaskId::new).collect(),
+                    ready,
                 })
                 .context("failed to add task")?;
             tracing::info!(task_id = task.id.get(), "task added");
             println!("{}", task.id);
+        }
+        TaskCommand::Ready { id } => {
+            let task = store
+                .ready_task(TaskId::new(id))
+                .with_context(|| format!("failed to mark task {id} ready"))?;
+            tracing::info!(task_id = task.id.get(), "task marked ready");
+            println!("task {} ready", task.id);
         }
         TaskCommand::List { status } => {
             let tasks = store.list_tasks(status).context("failed to list tasks")?;
