@@ -92,6 +92,7 @@ mod tests {
             default_profile: profiles[0].name.clone(),
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
+            landing: Default::default(),
             profiles,
             learning: Default::default(),
         }

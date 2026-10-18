@@ -781,6 +781,7 @@ mod tests {
             default_profile: "local".to_owned(),
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
+            landing: Default::default(),
             profiles: vec![profile("local"), profile("alt")],
             learning: Default::default(),
         }
@@ -1090,6 +1091,7 @@ mod tests {
             default_profile: profiles[0].name.clone(),
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
+            landing: Default::default(),
             profiles,
             learning: Default::default(),
         }

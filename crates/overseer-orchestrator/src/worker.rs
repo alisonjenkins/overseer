@@ -263,6 +263,7 @@ mod tests {
             default_profile: "succeed".to_owned(),
             review: overseer_core::ReviewConfig::default(),
             escalation: Default::default(),
+            landing: Default::default(),
             profiles: vec![
                 fake_command_profile("succeed", "echo ok > file.txt && echo done"),
                 fake_command_profile("fail", "exit 1"),

@@ -58,6 +58,15 @@ default_profile = "local"
 #     "**/secrets/**",
 # ]
 
+# Automated landing: push a reviewed task branch to a pull request on the
+# remote, running test_command first, and optionally fast-forward merging if gates pass.
+#
+# [landing]
+# remote = "origin"
+# base = "main"
+# auto_merge = false
+# test_command = "cargo test"
+
 # A llama.cpp-style server on this machine. An openai backend returns text only
 # and cannot edit files.
 [[profiles]]
@@ -348,6 +357,46 @@ impl Default for EscalationConfig {
     }
 }
 
+/// Configuration for automated landing and PR creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingConfig {
+    #[serde(default = "default_landing_remote")]
+    pub remote: String,
+    #[serde(default = "default_landing_base")]
+    pub base: String,
+    #[serde(default)]
+    pub auto_merge: bool,
+    #[serde(default, deserialize_with = "deserialize_empty_as_none")]
+    pub test_command: Option<String>,
+}
+
+fn default_landing_remote() -> String {
+    "origin".to_owned()
+}
+fn default_landing_base() -> String {
+    "main".to_owned()
+}
+
+impl Default for LandingConfig {
+    fn default() -> Self {
+        Self {
+            remote: default_landing_remote(),
+            base: default_landing_base(),
+            auto_merge: false,
+            test_command: None,
+        }
+    }
+}
+
+fn deserialize_empty_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.and_then(|s| (!s.is_empty()).then_some(s)))
+}
+
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -358,6 +407,8 @@ pub struct Config {
     pub review: ReviewConfig,
     #[serde(default)]
     pub escalation: EscalationConfig,
+    #[serde(default)]
+    pub landing: LandingConfig,
     #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
@@ -1402,5 +1453,35 @@ model = "local"
             parse_err(text),
             CoreError::InvalidEscalationGlob { ref glob, .. } if glob == "[a-"
         ));
+    }
+
+    #[test]
+    fn landing_config_parses_defaults_and_custom() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert_eq!(config.landing.remote, "origin");
+        assert_eq!(config.landing.base, "main");
+        assert!(!config.landing.auto_merge);
+        assert_eq!(config.landing.test_command, None);
+
+        let text = format!(
+            "{MINIMAL}\n[landing]\nremote = \"upstream\"\nbase = \"trunk\"\nauto_merge = true\ntest_command = \"cargo test --all\"\n"
+        );
+        let custom = Config::from_toml_str(&text).unwrap();
+        assert_eq!(custom.landing.remote, "upstream");
+        assert_eq!(custom.landing.base, "trunk");
+        assert!(custom.landing.auto_merge);
+        assert_eq!(
+            custom.landing.test_command.as_deref(),
+            Some("cargo test --all")
+        );
+    }
+
+    #[test]
+    fn landing_config_zero_length_test_command_is_treated_as_unset() {
+        let text = format!("{MINIMAL}\n[landing]\ntest_command = \"\"\n");
+        assert_eq!(
+            Config::from_toml_str(&text).unwrap().landing.test_command,
+            None
+        );
     }
 }
