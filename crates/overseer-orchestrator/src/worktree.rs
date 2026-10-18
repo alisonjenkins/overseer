@@ -78,6 +78,14 @@ pub async fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>
     Ok(Some(sha.trim().to_owned()))
 }
 
+/// Drop every uncommitted change in `worktree`, tracked and untracked, so the
+/// next attempt starts from the task branch's last commit.
+pub async fn discard_changes(worktree: &Path) -> Result<(), WorktreeError> {
+    git(worktree, &["checkout", "--", "."]).await?;
+    git(worktree, &["clean", "-fd"]).await?;
+    Ok(())
+}
+
 /// Force-remove a worktree directory. The branch is left in place.
 pub async fn remove_worktree(repo: &Path, worktree: &Path) -> Result<(), WorktreeError> {
     let path_text = worktree.to_string_lossy().into_owned();

@@ -1,6 +1,7 @@
-//! Executes one task: claim, worktree, backend call, transcript, commit, and
-//! the final task status.
+//! Executes one task: claim, worktree, the attempts along its fallback chain,
+//! transcripts, commit, and the final task status.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use overseer_backends::{Backend, BackendError, build_backend};
@@ -10,6 +11,7 @@ use overseer_core::{
 };
 use overseer_store::{Store, StoreError};
 
+use crate::router::{RouterError, plan_attempts};
 use crate::worktree::{self, Worktree};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,12 +19,27 @@ pub enum RunnerError {
     #[error("task {task_id} names profile {profile:?}, which is not in overseer.toml")]
     UnknownProfile { task_id: TaskId, profile: String },
 
+    #[error("task {task_id} has no profile left to attempt")]
+    Route {
+        task_id: TaskId,
+        #[source]
+        source: RouterError,
+    },
+
     #[error("failed to build the backend for profile {profile:?}")]
     BuildBackend {
         profile: String,
         #[source]
         source: BackendError,
     },
+
+    #[error("no backend was supplied for profile {profile:?}")]
+    MissingBackend { profile: String },
+
+    /// The router never returns an empty plan and the first attempt is never
+    /// skipped, so this means a broken invariant rather than a bad input.
+    #[error("task {task_id} finished without a single attempt")]
+    NoAttempt { task_id: TaskId },
 
     /// One variant for every store call; `step` names the call that failed.
     #[error("store step {step} failed")]
@@ -33,8 +50,21 @@ pub enum RunnerError {
     },
 }
 
-/// What a finished run looked like. `status` is the task status it left
-/// behind: `Review` on success, `Blocked` on failure.
+/// One attempt along a task's fallback chain. `failure` is `None` when the
+/// attempt succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptSummary {
+    pub run_id: RunId,
+    pub profile: String,
+    pub failure: Option<FailureKind>,
+    pub usage: Usage,
+    pub transcript_path: Option<PathBuf>,
+}
+
+/// What a finished task execution looked like. `status` is the task status it
+/// left behind: `Review` on success, `Blocked` when every attempt failed. The
+/// top-level run fields describe the last attempt; `attempts` lists all of
+/// them in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     pub run_id: RunId,
@@ -46,9 +76,11 @@ pub struct RunSummary {
     pub commit: Option<String>,
     pub usage: Usage,
     pub transcript_path: Option<PathBuf>,
+    pub attempts: Vec<AttemptSummary>,
 }
 
-/// Run a task on the backend its profile names (or `default_profile`).
+/// Run a task along its fallback chain, building each backend from its
+/// profile.
 pub async fn run_task(
     store: &mut Store,
     config: &Config,
@@ -56,16 +88,41 @@ pub async fn run_task(
     task_id: TaskId,
 ) -> Result<RunSummary, RunnerError> {
     let task = store.get_task(task_id).map_err(store_step("load task"))?;
-    let profile = select_profile(config, &task)?;
-    let backend = build_backend(profile).map_err(|source| RunnerError::BuildBackend {
-        profile: profile.name.clone(),
-        source,
-    })?;
-    execute(store, config, state_dir, task_id, profile, backend.as_ref()).await
+    let plan = plan_for(store, config, &task)?;
+    let built = plan
+        .iter()
+        .map(|profile| {
+            build_backend(profile)
+                .map(|backend| (profile.name.as_str(), backend))
+                .map_err(|source| RunnerError::BuildBackend {
+                    profile: profile.name.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let backends: HashMap<&str, &dyn Backend> = built
+        .iter()
+        .map(|(name, backend)| (*name, backend.as_ref()))
+        .collect();
+    execute(store, config, state_dir, task_id, &plan, &backends).await
 }
 
-/// Like `run_task`, but with the backend supplied by the caller. Used by tests
-/// to substitute a `MockBackend`.
+/// Like `run_task`, but with the backends supplied by the caller, keyed by
+/// profile name. Used by tests to substitute `MockBackend`s.
+pub async fn run_task_with_backends(
+    store: &mut Store,
+    config: &Config,
+    state_dir: &Path,
+    task_id: TaskId,
+    backends: &HashMap<&str, &dyn Backend>,
+) -> Result<RunSummary, RunnerError> {
+    let task = store.get_task(task_id).map_err(store_step("load task"))?;
+    let plan = plan_for(store, config, &task)?;
+    execute(store, config, state_dir, task_id, &plan, backends).await
+}
+
+/// Like `run_task_with_backends`, with one backend answering for every
+/// profile in the config.
 pub async fn run_task_with_backend(
     store: &mut Store,
     config: &Config,
@@ -73,9 +130,12 @@ pub async fn run_task_with_backend(
     task_id: TaskId,
     backend: &dyn Backend,
 ) -> Result<RunSummary, RunnerError> {
-    let task = store.get_task(task_id).map_err(store_step("load task"))?;
-    let profile = select_profile(config, &task)?;
-    execute(store, config, state_dir, task_id, profile, backend).await
+    let backends: HashMap<&str, &dyn Backend> = config
+        .profiles
+        .iter()
+        .map(|profile| (profile.name.as_str(), backend))
+        .collect();
+    run_task_with_backends(store, config, state_dir, task_id, &backends).await
 }
 
 fn select_profile<'a>(config: &'a Config, task: &Task) -> Result<&'a Profile, RunnerError> {
@@ -86,6 +146,23 @@ fn select_profile<'a>(config: &'a Config, task: &Task) -> Result<&'a Profile, Ru
             task_id: task.id,
             profile: name.to_owned(),
         })
+}
+
+/// The profiles to attempt, in order, for `task`, given the current
+/// `credits_low` mode.
+fn plan_for<'a>(
+    store: &Store,
+    config: &'a Config,
+    task: &Task,
+) -> Result<Vec<&'a Profile>, RunnerError> {
+    let start = select_profile(config, task)?;
+    let credits_low = store
+        .credits_low()
+        .map_err(store_step("read credits_low"))?;
+    plan_attempts(config, start, credits_low).map_err(|source| RunnerError::Route {
+        task_id: task.id,
+        source,
+    })
 }
 
 fn store_step(step: &'static str) -> impl FnOnce(StoreError) -> RunnerError {
@@ -112,79 +189,155 @@ impl Attempt {
     }
 }
 
+/// Walk `plan` in order until an attempt succeeds, fails with `Other`, or the
+/// plan runs out. Every attempt is its own run row with its own transcript,
+/// all on the task's one worktree and branch.
 async fn execute(
     store: &mut Store,
     config: &Config,
     state_dir: &Path,
     task_id: TaskId,
-    profile: &Profile,
-    backend: &dyn Backend,
+    plan: &[&Profile],
+    backends: &HashMap<&str, &dyn Backend>,
 ) -> Result<RunSummary, RunnerError> {
+    let steps = plan
+        .iter()
+        .map(|profile| {
+            backends
+                .get(profile.name.as_str())
+                .map(|backend| (*profile, *backend))
+                .ok_or_else(|| RunnerError::MissingBackend {
+                    profile: profile.name.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let task = store
         .claim_task(task_id)
         .map_err(store_step("claim task"))?;
-    let run_id = store
-        .start_run(task_id, &profile.name)
-        .map_err(store_step("start run"))?;
 
-    let (branch, mut attempt) = match worktree::create(&config.repo, state_dir, task_id).await {
-        Ok(worktree) => {
-            let attempt = run_in_worktree(backend, profile, &task, &worktree).await;
-            (worktree.branch, attempt)
-        }
-        Err(err) => (
-            worktree::branch_name(task_id),
-            Attempt::failed(FailureKind::Other(format!("worktree: {err}"))),
-        ),
+    let worktree = worktree::create(&config.repo, state_dir, task_id).await;
+    let branch = match &worktree {
+        Ok(worktree) => worktree.branch.clone(),
+        Err(_) => worktree::branch_name(task_id),
     };
 
-    let transcript_path =
-        match write_transcript(state_dir, run_id, &task, profile, &branch, &attempt).await {
-            Ok(path) => Some(path),
-            Err(err) => {
-                attempt
-                    .failure
-                    .get_or_insert(FailureKind::Other(format!("transcript: {err}")));
-                None
+    let mut attempts: Vec<AttemptSummary> = Vec::new();
+    let mut commit = None;
+    let mut credits_exhausted = false;
+    for (profile, backend) in steps {
+        if credits_exhausted && profile.metered {
+            tracing::info!(
+                task_id = task_id.get(),
+                profile = %profile.name,
+                "skipping metered profile after credits ran out during this task"
+            );
+            continue;
+        }
+        let run_id = store
+            .start_run(task_id, &profile.name)
+            .map_err(store_step("start run"))?;
+
+        let mut attempt = match &worktree {
+            Ok(worktree) => {
+                let ready = if attempts.is_empty() {
+                    Ok(())
+                } else {
+                    worktree::discard_changes(&worktree.path).await
+                };
+                match ready {
+                    Ok(()) => run_in_worktree(backend, profile, &task, worktree).await,
+                    Err(err) => Attempt::failed(FailureKind::Other(format!("discard: {err}"))),
+                }
             }
+            Err(err) => Attempt::failed(FailureKind::Other(format!("worktree: {err}"))),
         };
 
-    let status = if attempt.failure.is_none() {
-        RunStatus::Succeeded
-    } else {
-        RunStatus::Failed
+        let transcript_path =
+            match write_transcript(state_dir, run_id, &task, profile, &branch, &attempt).await {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    attempt
+                        .failure
+                        .get_or_insert(FailureKind::Other(format!("transcript: {err}")));
+                    None
+                }
+            };
+
+        let status = if attempt.failure.is_none() {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Failed
+        };
+        store
+            .finish_run(
+                run_id,
+                RunFinish {
+                    status,
+                    usage: attempt.usage,
+                    failure: attempt.failure.as_ref().map(ToString::to_string),
+                    transcript_path: transcript_path.clone(),
+                    branch: Some(branch.clone()),
+                },
+            )
+            .map_err(store_step("finish run"))?;
+
+        if attempt.failure.is_some()
+            && profile.metered
+            && attempt.failure == Some(FailureKind::QuotaExhausted)
+        {
+            store
+                .set_credits_low(true)
+                .map_err(store_step("set credits_low"))?;
+            credits_exhausted = true;
+            tracing::warn!(
+                task_id = task_id.get(),
+                profile = %profile.name,
+                "metered profile is out of credits; credits_low is now on"
+            );
+        }
+
+        let failure = attempt.failure.clone();
+        let succeeded = failure.is_none();
+        if succeeded {
+            commit = attempt.commit.clone();
+        }
+        attempts.push(AttemptSummary {
+            run_id,
+            profile: profile.name.clone(),
+            failure: failure.clone(),
+            usage: attempt.usage,
+            transcript_path,
+        });
+        match failure {
+            None => break,
+            Some(kind) if !kind.is_routable() => break,
+            Some(_) => {}
+        }
+    }
+
+    let Some(last) = attempts.last().cloned() else {
+        return Err(RunnerError::NoAttempt { task_id });
     };
-    let task_status = if attempt.failure.is_none() {
+    let task_status = if last.failure.is_none() {
         TaskStatus::Review
     } else {
         TaskStatus::Blocked
     };
     store
-        .finish_run(
-            run_id,
-            RunFinish {
-                status,
-                usage: attempt.usage,
-                failure: attempt.failure.as_ref().map(ToString::to_string),
-                transcript_path: transcript_path.clone(),
-                branch: Some(branch.clone()),
-            },
-        )
-        .map_err(store_step("finish run"))?;
-    store
         .set_status(task_id, task_status)
         .map_err(store_step("set task status"))?;
 
     Ok(RunSummary {
-        run_id,
+        run_id: last.run_id,
         task_id,
-        profile: profile.name.clone(),
+        profile: last.profile,
         status: task_status,
-        failure: attempt.failure,
+        failure: last.failure,
         branch,
-        commit: attempt.commit,
-        usage: attempt.usage,
-        transcript_path,
+        commit,
+        usage: last.usage,
+        transcript_path: last.transcript_path,
+        attempts,
     })
 }
 
@@ -590,5 +743,262 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert_eq!(fx.store.get_task(task).unwrap().status, TaskStatus::Backlog);
+    }
+
+    fn with_fallback(mut profile: Profile, fallback: &[&str]) -> Profile {
+        profile.fallback = fallback.iter().map(|name| (*name).to_owned()).collect();
+        profile
+    }
+
+    fn metered(mut profile: Profile) -> Profile {
+        profile.metered = true;
+        profile
+    }
+
+    fn chain_config(repo: &Path, profiles: Vec<Profile>) -> Config {
+        Config {
+            repo: repo.to_path_buf(),
+            default_profile: profiles[0].name.clone(),
+            profiles,
+        }
+    }
+
+    fn failing(kind: FailureKind) -> Result<RunOutcome, String> {
+        Ok(RunOutcome {
+            output: String::new(),
+            usage: Usage::default(),
+            failure: Some(kind),
+        })
+    }
+
+    fn attempt_log(summary: &RunSummary) -> Vec<(String, Option<FailureKind>)> {
+        summary
+            .attempts
+            .iter()
+            .map(|attempt| (attempt.profile.clone(), attempt.failure.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unreachable_local_falls_back_to_gemini() {
+        let mut fx = fixture();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                with_fallback(profile("local"), &["gemini"]),
+                profile("gemini"),
+            ],
+        );
+        let task = add(&mut fx.store, "chain", "");
+        let local = MockBackend::new(vec![failing(FailureKind::Unreachable)]);
+        let gemini = MockBackend::answering("done");
+        let backends: HashMap<&str, &dyn Backend> =
+            HashMap::from([("local", &local as &dyn Backend), ("gemini", &gemini)]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Review);
+        assert_eq!(summary.profile, "gemini");
+        assert_eq!(
+            attempt_log(&summary),
+            vec![
+                ("local".to_owned(), Some(FailureKind::Unreachable)),
+                ("gemini".to_owned(), None),
+            ]
+        );
+        let runs = fx.store.list_runs(task).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(runs[1].status, RunStatus::Succeeded);
+        assert_ne!(runs[0].transcript_path, runs[1].transcript_path);
+        assert!(fx.state.join("runs").join("1.md").exists());
+        assert!(fx.state.join("runs").join("2.md").exists());
+    }
+
+    #[tokio::test]
+    async fn metered_quota_failure_turns_credits_low_on_and_moves_on() {
+        let mut fx = fixture();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                metered(with_fallback(profile("claude"), &["local"])),
+                profile("local"),
+            ],
+        );
+        let task = add(&mut fx.store, "metered", "");
+        let claude = MockBackend::new(vec![failing(FailureKind::QuotaExhausted)]);
+        let local = MockBackend::answering("done");
+        let backends: HashMap<&str, &dyn Backend> =
+            HashMap::from([("claude", &claude as &dyn Backend), ("local", &local)]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Review);
+        assert_eq!(
+            attempt_log(&summary),
+            vec![
+                ("claude".to_owned(), Some(FailureKind::QuotaExhausted)),
+                ("local".to_owned(), None),
+            ]
+        );
+        assert!(fx.store.credits_low().unwrap());
+    }
+
+    #[tokio::test]
+    async fn other_failure_stops_the_chain_and_blocks_the_task() {
+        let mut fx = fixture();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                with_fallback(profile("local"), &["gemini"]),
+                profile("gemini"),
+            ],
+        );
+        let task = add(&mut fx.store, "broken", "");
+        let local = MockBackend::new(vec![failing(FailureKind::Other("exit 2".to_owned()))]);
+        let gemini = MockBackend::answering("unused");
+        let backends: HashMap<&str, &dyn Backend> =
+            HashMap::from([("local", &local as &dyn Backend), ("gemini", &gemini)]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Blocked);
+        assert_eq!(
+            attempt_log(&summary),
+            vec![(
+                "local".to_owned(),
+                Some(FailureKind::Other("exit 2".to_owned()))
+            )]
+        );
+        assert!(gemini.requests().is_empty());
+        assert_eq!(fx.store.get_task(task).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn credits_low_skips_metered_profiles() {
+        let mut fx = fixture();
+        fx.store.set_credits_low(true).unwrap();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                metered(with_fallback(profile("claude"), &["local"])),
+                profile("local"),
+            ],
+        );
+        let task = add(&mut fx.store, "cheap", "");
+        let claude = MockBackend::answering("should not run");
+        let local = MockBackend::answering("done");
+        let backends: HashMap<&str, &dyn Backend> =
+            HashMap::from([("claude", &claude as &dyn Backend), ("local", &local)]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert!(claude.requests().is_empty());
+        assert_eq!(attempt_log(&summary), vec![("local".to_owned(), None)]);
+        assert_eq!(summary.status, TaskStatus::Review);
+    }
+
+    #[tokio::test]
+    async fn every_attempt_failing_blocks_with_the_last_failure() {
+        let mut fx = fixture();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                with_fallback(profile("local"), &["gemini"]),
+                profile("gemini"),
+            ],
+        );
+        let task = add(&mut fx.store, "hopeless", "");
+        let local = MockBackend::new(vec![failing(FailureKind::Unreachable)]);
+        let gemini = MockBackend::new(vec![failing(FailureKind::AuthRequired)]);
+        let backends: HashMap<&str, &dyn Backend> =
+            HashMap::from([("local", &local as &dyn Backend), ("gemini", &gemini)]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Blocked);
+        assert_eq!(summary.failure, Some(FailureKind::AuthRequired));
+        assert_eq!(summary.attempts.len(), 2);
+        assert_eq!(fx.store.get_task(task).unwrap().status, TaskStatus::Blocked);
+        let statuses: Vec<RunStatus> = fx
+            .store
+            .list_runs(task)
+            .unwrap()
+            .iter()
+            .map(|run| run.status)
+            .collect();
+        assert_eq!(statuses, vec![RunStatus::Failed, RunStatus::Failed]);
+    }
+
+    /// Edits a tracked file and leaves an untracked one, then fails.
+    struct DirtyThenFail;
+
+    #[async_trait]
+    impl Backend for DirtyThenFail {
+        async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            std::fs::write(req.workdir.join("junk.txt"), "half done\n").unwrap();
+            std::fs::write(req.workdir.join("README.md"), "half edited\n").unwrap();
+            Ok(RunOutcome {
+                output: "partial".to_owned(),
+                usage: Usage::default(),
+                failure: Some(FailureKind::Unreachable),
+            })
+        }
+    }
+
+    /// Records whether the worktree still holds the previous attempt's edits.
+    struct CheckForLeftovers {
+        leftovers: std::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl Backend for CheckForLeftovers {
+        async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            let readme = std::fs::read_to_string(req.workdir.join("README.md")).unwrap();
+            let dirty = req.workdir.join("junk.txt").exists() || readme != "base\n";
+            *self.leftovers.lock().unwrap() = Some(dirty);
+            Ok(RunOutcome {
+                output: "clean start".to_owned(),
+                usage: Usage::default(),
+                failure: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_from_a_failed_attempt_are_discarded_before_the_next() {
+        let mut fx = fixture();
+        let config = chain_config(
+            &fx.repo,
+            vec![
+                with_fallback(profile("local"), &["gemini"]),
+                profile("gemini"),
+            ],
+        );
+        let task = add(&mut fx.store, "retry", "");
+        let gemini = CheckForLeftovers {
+            leftovers: std::sync::Mutex::new(None),
+        };
+        let backends: HashMap<&str, &dyn Backend> = HashMap::from([
+            ("local", &DirtyThenFail as &dyn Backend),
+            ("gemini", &gemini),
+        ]);
+
+        let summary = run_task_with_backends(&mut fx.store, &config, &fx.state, task, &backends)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Review);
+        assert_eq!(*gemini.leftovers.lock().unwrap(), Some(false));
     }
 }
