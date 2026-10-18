@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use overseer_core::{NewTask, Task, TaskId, TaskStatus};
+use overseer_core::{NewTask, Run, RunFinish, RunId, RunStatus, Task, TaskId, TaskStatus, Usage};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use time::OffsetDateTime;
@@ -8,10 +8,22 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::StoreError;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_runs.sql")),
+];
 
 const SELECT_TASK: &str =
     "SELECT id, title, body, status, priority, profile, round, created_at FROM tasks";
+
+const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
+     input_tokens, output_tokens, failure, transcript_path, branch FROM runs";
+
+fn now_rfc3339() -> Result<String, StoreError> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|source| StoreError::FormatTimestamp { source })
+}
 
 pub struct Store {
     conn: Connection,
@@ -166,6 +178,90 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Atomically move a `backlog` or `ready` task to `running`. Any other
+    /// status is an error, so a second claim of the same task fails.
+    pub fn claim_task(&mut self, id: TaskId) -> Result<Task, StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'running' \
+                 WHERE id = ?1 AND status IN ('backlog', 'ready')",
+                params![id.get()],
+            )
+            .map_err(|source| StoreError::ClaimTask { id, source })?;
+        if changed == 1 {
+            return self.get_task(id);
+        }
+        let current = self.get_task(id)?;
+        Err(StoreError::TaskNotClaimable {
+            id,
+            status: current.status,
+        })
+    }
+
+    /// Record the start of an attempt at `task_id` on `profile`.
+    pub fn start_run(&mut self, task_id: TaskId, profile: &str) -> Result<RunId, StoreError> {
+        let started_at = now_rfc3339()?;
+        self.conn
+            .execute(
+                "INSERT INTO runs (task_id, profile, started_at, status) \
+                 VALUES (?1, ?2, ?3, 'running')",
+                params![task_id.get(), profile, started_at],
+            )
+            .map_err(|source| StoreError::InsertRun { task_id, source })?;
+        Ok(RunId::new(self.conn.last_insert_rowid()))
+    }
+
+    /// Record how a run ended. `RunStatus::Running` is not a valid final state.
+    pub fn finish_run(&mut self, id: RunId, finish: RunFinish) -> Result<(), StoreError> {
+        if finish.status == RunStatus::Running {
+            return Err(StoreError::InvalidRunFinish { id });
+        }
+        let finished_at = now_rfc3339()?;
+        let transcript = finish
+            .transcript_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE runs SET status = ?1, finished_at = ?2, input_tokens = ?3, \
+                 output_tokens = ?4, failure = ?5, transcript_path = ?6, branch = ?7 \
+                 WHERE id = ?8",
+                params![
+                    finish.status.as_str(),
+                    finished_at,
+                    // Token counts stored as signed SQLite integers; a count
+                    // above i64::MAX cannot come from a real model response.
+                    i64::try_from(finish.usage.input_tokens).unwrap_or(i64::MAX),
+                    i64::try_from(finish.usage.output_tokens).unwrap_or(i64::MAX),
+                    finish.failure,
+                    transcript,
+                    finish.branch,
+                    id.get(),
+                ],
+            )
+            .map_err(|source| StoreError::UpdateRun { id, source })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownRun { id });
+        }
+        Ok(())
+    }
+
+    /// All runs of a task, oldest first.
+    pub fn list_runs(&self, task_id: TaskId) -> Result<Vec<Run>, StoreError> {
+        let list_err = |source| StoreError::ListRuns { task_id, source };
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SELECT_RUN} WHERE task_id = ?1 ORDER BY id ASC"))
+            .map_err(list_err)?;
+        let runs = stmt
+            .query_map(params![task_id.get()], run_from_row)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Run>>>())
+            .map_err(list_err)?;
+        Ok(runs)
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -219,6 +315,39 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
+    let status_text: String = row.get(3)?;
+    let status = RunStatus::from_db_text(&status_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            format!("unknown run status {status_text:?}").into(),
+        )
+    })?;
+    let token_count = |idx: usize| -> rusqlite::Result<u64> {
+        let raw: i64 = row.get(idx)?;
+        u64::try_from(raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(idx, Type::Integer, Box::new(err))
+        })
+    };
+    let transcript: Option<String> = row.get(9)?;
+    Ok(Run {
+        id: RunId::new(row.get(0)?),
+        task_id: TaskId::new(row.get(1)?),
+        profile: row.get(2)?,
+        status,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        usage: Usage {
+            input_tokens: token_count(6)?,
+            output_tokens: token_count(7)?,
+        },
+        failure: row.get(8)?,
+        transcript_path: transcript.map(PathBuf::from),
+        branch: row.get(10)?,
+    })
+}
+
 fn load_deps(conn: &Connection, id: TaskId) -> rusqlite::Result<Vec<TaskId>> {
     let mut stmt =
         conn.prepare("SELECT depends_on FROM task_deps WHERE task_id = ?1 ORDER BY depends_on")?;
@@ -230,9 +359,11 @@ fn load_deps(conn: &Connection, id: TaskId) -> rusqlite::Result<Vec<TaskId>> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use overseer_core::{NewTask, TaskId, TaskStatus};
+    use std::path::PathBuf;
+
+    use overseer_core::{NewTask, RunFinish, RunId, RunStatus, TaskId, TaskStatus, Usage};
 
     use super::Store;
     use crate::StoreError;
@@ -404,5 +535,190 @@ mod tests {
 
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.get_task(added.id).unwrap(), added);
+    }
+
+    fn finished(status: RunStatus) -> RunFinish {
+        RunFinish {
+            status,
+            usage: Usage {
+                input_tokens: 120,
+                output_tokens: 45,
+            },
+            failure: None,
+            transcript_path: Some(PathBuf::from("/state/runs/1.md")),
+            branch: Some("overseer/task-1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn claim_moves_backlog_task_to_running_once() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+
+        let claimed = store.claim_task(task.id).unwrap();
+        assert_eq!(claimed.status, TaskStatus::Running);
+
+        let err = store.claim_task(task.id).unwrap_err();
+        assert!(
+            matches!(err, StoreError::TaskNotClaimable { id, status: TaskStatus::Running } if id == task.id),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn claim_accepts_ready_and_rejects_done() {
+        let mut store = memory_store();
+        let ready = store.add_task(new_task("ready", 0)).unwrap();
+        store.set_status(ready.id, TaskStatus::Ready).unwrap();
+        assert_eq!(
+            store.claim_task(ready.id).unwrap().status,
+            TaskStatus::Running
+        );
+
+        let done = store.add_task(new_task("done", 0)).unwrap();
+        store.set_status(done.id, TaskStatus::Done).unwrap();
+        let err = store.claim_task(done.id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::TaskNotClaimable {
+                    status: TaskStatus::Done,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn claim_unknown_task_is_an_error() {
+        let mut store = memory_store();
+        let err = store.claim_task(TaskId::new(7)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnknownTask { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn start_run_records_a_running_row() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let run = store.start_run(task.id, "local").unwrap();
+
+        let runs = store.list_runs(task.id).unwrap();
+        assert_eq!(runs.len(), 1);
+        let row = &runs[0];
+        assert_eq!(row.id, run);
+        assert_eq!(row.task_id, task.id);
+        assert_eq!(row.profile, "local");
+        assert_eq!(row.status, RunStatus::Running);
+        assert!(row.started_at.ends_with('Z'), "{}", row.started_at);
+        assert_eq!(row.finished_at, None);
+        assert_eq!(row.usage, Usage::default());
+        assert_eq!(row.failure, None);
+        assert_eq!(row.transcript_path, None);
+        assert_eq!(row.branch, None);
+    }
+
+    #[test]
+    fn finish_run_records_usage_transcript_and_branch() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let run = store.start_run(task.id, "local").unwrap();
+        store
+            .finish_run(run, finished(RunStatus::Succeeded))
+            .unwrap();
+
+        let row = store.list_runs(task.id).unwrap().remove(0);
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert!(row.finished_at.is_some());
+        assert_eq!(
+            row.usage,
+            Usage {
+                input_tokens: 120,
+                output_tokens: 45
+            }
+        );
+        assert_eq!(row.transcript_path, Some(PathBuf::from("/state/runs/1.md")));
+        assert_eq!(row.branch.as_deref(), Some("overseer/task-1"));
+    }
+
+    #[test]
+    fn finish_run_records_failure_text() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let run = store.start_run(task.id, "local").unwrap();
+        let failure = RunFinish {
+            failure: Some("unreachable".to_owned()),
+            ..finished(RunStatus::Failed)
+        };
+        store.finish_run(run, failure).unwrap();
+
+        let row = store.list_runs(task.id).unwrap().remove(0);
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(row.failure.as_deref(), Some("unreachable"));
+    }
+
+    #[test]
+    fn finishing_as_running_or_unknown_run_is_rejected() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let run = store.start_run(task.id, "local").unwrap();
+
+        let err = store
+            .finish_run(run, finished(RunStatus::Running))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidRunFinish { id } if id == run),
+            "unexpected error: {err:?}"
+        );
+
+        let err = store
+            .finish_run(RunId::new(999), finished(RunStatus::Failed))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnknownRun { id } if id == RunId::new(999)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_runs_returns_only_that_tasks_runs_oldest_first() {
+        let mut store = memory_store();
+        let first = store.add_task(new_task("first", 0)).unwrap();
+        let second = store.add_task(new_task("second", 0)).unwrap();
+        let r1 = store.start_run(first.id, "local").unwrap();
+        store.start_run(second.id, "local").unwrap();
+        let r2 = store.start_run(first.id, "agy").unwrap();
+
+        let ids: Vec<RunId> = store
+            .list_runs(first.id)
+            .unwrap()
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(ids, vec![r1, r2]);
+        assert!(store.list_runs(TaskId::new(999)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn runs_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.db");
+        let task_id = {
+            let mut store = Store::open(&path).unwrap();
+            let task = store.add_task(new_task("kept", 0)).unwrap();
+            let run = store.start_run(task.id, "local").unwrap();
+            store
+                .finish_run(run, finished(RunStatus::Succeeded))
+                .unwrap();
+            task.id
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let runs = reopened.list_runs(task_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Succeeded);
     }
 }
