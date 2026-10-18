@@ -8,7 +8,7 @@ use overseer_orchestrator::{
     doctor_report,
 };
 
-use crate::cli::{Command, ConfigCommand, ModeCommand, Switch, TaskCommand};
+use crate::cli::{Command, ConfigCommand, ModeCommand, SkillsCommand, Switch, TaskCommand};
 use crate::state;
 
 /// Exit code for a run that ended with its task blocked, so scripts can tell it
@@ -110,6 +110,10 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         Command::Doctor { deep } => run_doctor(&dir, deep).map_err(CliError::from),
         Command::Mode(mode) => {
             run_mode(&dir, mode)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Skills(skills) => {
+            run_skills(&dir, skills)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -319,6 +323,67 @@ fn run_mode(dir: &Path, command: ModeCommand) -> Result<()> {
         .context("failed to read credits-low mode")?;
     println!("credits-low: {}", if credits_low { "on" } else { "off" });
     Ok(())
+}
+
+fn run_skills(dir: &Path, command: SkillsCommand) -> Result<()> {
+    state::open_existing_store(dir)?;
+    let skills_dir = dir.join("skills");
+    match command {
+        SkillsCommand::List => {
+            let skills = overseer_store::skills::list_skills(&skills_dir)?;
+            print_skills(&skills);
+        }
+        SkillsCommand::Show { name, version } => {
+            let content = match version {
+                Some(v) => overseer_store::skills::read_skill_version(&skills_dir, &name, v)?,
+                None => match overseer_store::skills::read_current_skill(&skills_dir, &name)? {
+                    Some((_, c)) => c,
+                    None => bail!("skill '{name}' not found"),
+                },
+            };
+            print!("{content}");
+            if !content.ends_with('\n') {
+                println!();
+            }
+        }
+        SkillsCommand::Add { name, file } => {
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read skill file {}", file.display()))?;
+            let version =
+                overseer_store::skills::create_next_version(&skills_dir, &name, &content)?;
+            println!("skill {name} v{version} created");
+        }
+        SkillsCommand::UseVersion { name, version } => {
+            overseer_store::skills::set_current_version(&skills_dir, &name, version)?;
+            println!("skill {name} set to v{version}");
+        }
+    }
+    Ok(())
+}
+
+fn print_skills(skills: &[overseer_store::skills::SkillSummary]) {
+    let name_width = skills
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .max("NAME".len());
+    println!(
+        "{:<w$}  {:>7}  {:>8}",
+        "NAME",
+        "VERSION",
+        "SIZE",
+        w = name_width
+    );
+    for skill in skills {
+        println!(
+            "{:<w$}  {:>7}  {:>8}",
+            skill.name,
+            format!("v{}", skill.current_version),
+            skill.size_bytes,
+            w = name_width
+        );
+    }
 }
 
 fn list_runs(dir: &Path, task_id: i64) -> Result<()> {

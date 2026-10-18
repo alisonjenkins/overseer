@@ -86,6 +86,9 @@ pub enum Command {
     /// Show or change the routing mode.
     #[command(subcommand)]
     Mode(ModeCommand),
+    /// Manage skills.
+    #[command(subcommand)]
+    Skills(SkillsCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,6 +120,34 @@ pub enum ModeCommand {
 pub enum Switch {
     On,
     Off,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    /// List all skills.
+    List,
+    /// Show a skill's content.
+    Show {
+        /// Skill name.
+        name: String,
+        /// Version number to show (defaults to active version).
+        #[arg(long)]
+        version: Option<u32>,
+    },
+    /// Add a new version of a skill from a file.
+    Add {
+        /// Skill name.
+        name: String,
+        /// Path to the markdown file containing the skill content.
+        file: PathBuf,
+    },
+    /// Set the active version for a skill.
+    UseVersion {
+        /// Skill name.
+        name: String,
+        /// Version number to make active.
+        version: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
