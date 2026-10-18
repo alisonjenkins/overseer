@@ -11,7 +11,12 @@ use crate::StoreError;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_runs.sql")),
+    (3, include_str!("../migrations/0003_settings.sql")),
 ];
+
+/// Settings key holding the `credits_low` mode flag, stored as `"true"` or
+/// `"false"`.
+const CREDITS_LOW_KEY: &str = "credits_low";
 
 const SELECT_TASK: &str =
     "SELECT id, title, body, status, priority, profile, round, created_at FROM tasks";
@@ -261,6 +266,45 @@ impl Store {
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Run>>>())
             .map_err(list_err)?;
         Ok(runs)
+    }
+
+    /// The stored value of `key`, or `None` if it was never set.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| StoreError::GetSetting {
+                key: key.to_owned(),
+                source,
+            })
+    }
+
+    /// Store `value` under `key`, replacing any previous value.
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|source| StoreError::SetSetting {
+                key: key.to_owned(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Whether `credits_low` mode is on. Off when never set.
+    pub fn credits_low(&self) -> Result<bool, StoreError> {
+        Ok(self.get_setting(CREDITS_LOW_KEY)?.as_deref() == Some("true"))
+    }
+
+    pub fn set_credits_low(&mut self, on: bool) -> Result<(), StoreError> {
+        self.set_setting(CREDITS_LOW_KEY, if on { "true" } else { "false" })
     }
 }
 
@@ -720,5 +764,44 @@ mod tests {
         let runs = reopened.list_runs(task_id).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Succeeded);
+    }
+
+    #[test]
+    fn unset_setting_reads_as_none() {
+        let store = memory_store();
+        assert_eq!(store.get_setting("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn set_setting_overwrites_the_previous_value() {
+        let mut store = memory_store();
+        store.set_setting("theme", "dark").unwrap();
+        store.set_setting("theme", "light").unwrap();
+        assert_eq!(
+            store.get_setting("theme").unwrap().as_deref(),
+            Some("light")
+        );
+    }
+
+    #[test]
+    fn credits_low_is_off_until_set() {
+        let mut store = memory_store();
+        assert!(!store.credits_low().unwrap());
+        store.set_credits_low(true).unwrap();
+        assert!(store.credits_low().unwrap());
+        store.set_credits_low(false).unwrap();
+        assert!(!store.credits_low().unwrap());
+    }
+
+    #[test]
+    fn settings_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.set_credits_low(true).unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        assert!(reopened.credits_low().unwrap());
     }
 }

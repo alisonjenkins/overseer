@@ -113,4 +113,18 @@ pub enum StoreError {
 
     #[error("cannot depend on task {depends_on}: no such task")]
     UnknownDependency { depends_on: TaskId },
+
+    #[error("failed to read setting {key:?}")]
+    GetSetting {
+        key: String,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to write setting {key:?}")]
+    SetSetting {
+        key: String,
+        #[source]
+        source: rusqlite::Error,
+    },
 }
