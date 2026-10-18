@@ -154,6 +154,22 @@ fn run_diff(dir: &Path, id: i64, stat: bool) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn reconcile(store: &mut overseer_store::Store, repo: &Path) -> Result<()> {
+    let tasks = store
+        .list_tasks(Some(TaskStatus::Review))
+        .context("failed to list review tasks")?;
+    for task in tasks {
+        let branch = overseer_orchestrator::branch_name(task.id);
+        if let Ok(true) = overseer_orchestrator::branch_content_on_head(repo, &branch) {
+            store
+                .set_status(task.id, TaskStatus::Done)
+                .with_context(|| format!("failed to set task {} status to done", task.id))?;
+            println!("task {}: branch already on HEAD, marked done", task.id);
+        }
+    }
+    Ok(())
+}
+
 fn run_merge(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
     let config = state::load_config(dir)?;
     let mut store = state::open_existing_store(dir)?;
@@ -745,6 +761,11 @@ fn run_worker_cmd(
 ) -> Result<ExitCode> {
     let config = state::load_config(dir)?;
     let mut store = state::open_existing_store(dir)?;
+
+    if let Err(err) = reconcile(&mut store, &config.repo) {
+        eprintln!("warning: reconcile failed: {err:#}");
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -807,7 +828,17 @@ fn run_worker_cmd(
 }
 
 fn run_status(dir: &Path) -> Result<()> {
-    let store = state::open_existing_store(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    match state::load_config(dir) {
+        Ok(config) => {
+            if let Err(err) = reconcile(&mut store, &config.repo) {
+                eprintln!("warning: reconcile failed: {err:#}");
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: reconcile failed: {err:#}");
+        }
+    }
 
     let worker_pid = check_worker_status(dir).context("failed to inspect worker status")?;
     match worker_pid {
