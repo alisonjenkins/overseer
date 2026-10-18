@@ -4,12 +4,12 @@ Overseer is a single-user, local-first task orchestrator. It keeps a queue of
 software tasks in SQLite and is meant to hand them to whichever model backend
 is available: a local OpenAI-compatible server, the `agy` CLI, `claude -p`, or
 a shell command. The design is in [docs/spec.md](docs/spec.md); section 10
-lists the milestones. This repository currently implements M5: the task store,
+lists the milestones. This repository implements M7: the task store,
 the `openai` and `command` backends, per-task worktrees, fallback routing with
 credits-low mode, the worker queue drainer with single-worker locking and crash
-recovery, an automated review and bounded rework loop, and the `overseer` CLI for
-`init`, `config`, `task`, `run`, `runs`, `review`, `worker`, `status`, `mode`,
-`doctor`, `diff`, `merge` and `discard`.
+recovery, an automated review and bounded rework loop, skills injected into prompts,
+a learning loop proposing improvements from finished tasks as reviewable lessons,
+and the `overseer` CLI for all operations.
 
 ## Installation
 
@@ -516,6 +516,102 @@ The optional `[review]` table in `overseer.toml` configures automated code revie
 
 Review configuration is validated on load: reviewer profile names and `rework_profile` must exist in `[[profiles]]`.
 
+## Skills
+
+Skills are modular, versioned guidelines stored on disk in the state directory
+under `<state-dir>/skills/<name>/v<N>.md`, with an active version pointer file
+`<state-dir>/skills/<name>/current`. Skill names must match `[a-z0-9-]+`.
+
+### Skills CLI
+
+```sh
+overseer skills add general /path/to/guidelines.md    # creates v1 or next version
+overseer skills list                                  # lists name, active version, size
+overseer skills show general                          # shows active version content
+overseer skills show general --version 1              # shows specific version
+overseer skills use-version general 1                 # rollback or roll forward active version
+```
+
+### Prompt injection
+
+Profiles specify skills to include using `skills`:
+
+```toml
+[[profiles]]
+name = "claude"
+skills = ["rust-guidelines", "general"]
+```
+
+When building the system prompt for any backend, overseer appends each listed
+skill that exists on disk:
+
+```markdown
+## Skill: <name>
+<current content>
+```
+
+Unknown skill names produce a tracing warning without halting execution. When an
+attempt runs, the active skill names and versions (e.g. `rust-guidelines:v1,general:v2`)
+are recorded on the run row (`runs.skills`) for full traceability.
+
+## Learning and lessons
+
+Overseer implements a retrospective learning loop that analyzes past task
+outcomes and **proposes** improvements to skills. No lesson or skill update is
+ever applied automatically without human review.
+
+### Configuration
+
+Add a `[learning]` section to `overseer.toml`:
+
+```toml
+[learning]
+profile = "claude"          # profile used to analyze tasks (omitted = learning disabled)
+skill = "general"           # target skill to propose improvements for (default: general)
+min_signal = true           # only retrospect on rework, blocked, or needs-human (default: true)
+```
+
+When `min_signal = true` (the default), a clean first-pass `PASS` (a task that
+succeeded on its first attempt with round 0 and no failures) is skipped, because
+routine success offers no corrective signal. Tasks that required rework (multiple
+runs, retries, or non-zero rounds), ended in `blocked`, or were escalated to
+`needs-human` produce signal.
+
+### Retrospectives and lessons
+
+After a task reaches a terminal state (`review`, `blocked`, or `needs-human`), the
+worker checks if `[learning].profile` is configured and the signal rule passes.
+When triggered, it runs a retrospective:
+
+1. Assembles an analysis prompt containing the task title and body, the final diff
+   against the merge base (truncated to 40 KB), all run failures, and the current
+   content of the target skill.
+2. Prompts the learning profile at `read` permission through its standard attempt plan.
+3. The learning profile replies EITHER with exactly `NO CHANGE` OR with the complete
+   revised markdown for the target skill (imperative rules, at most 60 lines, no secrets
+   or task-specific paths).
+4. If a revision is proposed, overseer records a new row in the `lessons` table
+   (status `proposed`), writes `<state-dir>/lessons/<id>.md`, computes a unified
+   diff against the base version using `git diff --no-index`, and saves it to
+   `<state-dir>/lessons/<id>.diff`.
+
+### Lessons CLI
+
+Inspect, apply, or reject proposed lessons:
+
+```sh
+overseer lessons list                                  # list all proposed lessons
+overseer lessons list --status proposed               # filter by status (proposed, applied, rejected)
+overseer lessons show 1                               # print the unified diff
+overseer lessons apply 1                              # create next skill version and mark applied
+overseer lessons reject 1                             # mark lesson rejected
+overseer retro 1                                      # manually run retrospective on task 1
+```
+
+When applying a lesson, overseer verifies that the skill's current version on disk
+matches the lesson's `base_version`. If the skill has been modified since the lesson
+was proposed, the application is safely refused with an explanatory message.
+
 ## Profile field reference
 
 | Field | Type | Default | Meaning |
@@ -530,6 +626,7 @@ Review configuration is validated on load: reviewer profile names and `rework_pr
 | `prompt_flag` | string | none | Flag preceding the prompt argument for `command` (e.g. `"-p"`). |
 | `prompt_stdin` | bool | `false` | Send the prompt on stdin instead of as the last argument. |
 | `role_prompt` | string | none | System prompt, sent ahead of the task text. |
+| `skills` | array of strings | `[]` | Names of skills from `<state-dir>/skills` to append to the system prompt. |
 | `fallback` | array of profile names | `[]` | Profiles to try, in order, after this one fails routably. |
 | `permissions` | `read`, `write-workdir` or `write-shell` | `read` | Ceiling. A run never gets more than this. |
 | `permission_args` | table: level to array of strings | `{}` | Extra argv per effective permission level, before the prompt; substitutes `{workdir}`. |
@@ -538,8 +635,9 @@ Review configuration is validated on load: reviewer profile names and `rework_pr
 | `agent_tools` | bool | `false` | Run an agent tool loop instead of a single request (`openai` backend only). |
 | `max_steps` | integer | `40` | Maximum number of tool iterations before the run fails. |
 
-Configs are validated on load: unknown keys, duplicate names, unknown
-`default_profile` or `fallback` names, and fallback cycles are all rejected.
+Configs are validated on load: unknown keys, duplicate names, invalid skill
+names, unknown `default_profile` or `fallback` names, and fallback cycles are all
+rejected.
 
 ## Licence
 
