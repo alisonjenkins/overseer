@@ -43,12 +43,14 @@ role_prompt = "You are a careful senior engineer."
 fallback = []
 
 # Gemini through the agy CLI. Needs `agy` on PATH and signed in.
+# agy must be signed in (run `agy` once interactively).
 [[profiles]]
 name = "gemini"
 # command backend: runs this argv in the task worktree with the prompt appended
 # as the last argument.
 backend = "command"
-command = ["agy", "-p", "--model", "gemini-3.8-flash-medium"]
+command = ["agy", "--model", "gemini-3.8-flash-medium"]
+prompt_flag = "-p"
 permissions = "write-workdir"
 role_prompt = "You are a careful senior engineer."
 fallback = ["local"]
@@ -529,11 +531,36 @@ command = []
         assert!(local.fallback.is_empty());
         assert!(!local.metered);
 
+        let starter = Config::starter_toml(Path::new("/work/project"));
+        assert!(
+            starter.contains("agy must be signed in (run `agy` once interactively)"),
+            "{starter}"
+        );
+
         let gemini = config.profile("gemini").unwrap();
+        assert_eq!(
+            gemini.command.as_deref(),
+            Some(
+                &[
+                    "agy".to_owned(),
+                    "--model".to_owned(),
+                    "gemini-3.8-flash-medium".to_owned()
+                ][..]
+            )
+        );
+        assert_eq!(gemini.prompt_flag.as_deref(), Some("-p"));
         assert_eq!(gemini.fallback, ["local"]);
         assert_eq!(
             gemini.permission_args.get(&Permissions::Read),
             Some(&Vec::new())
+        );
+        assert_eq!(
+            gemini.permission_args.get(&Permissions::WriteWorkdir),
+            Some(&vec!["--mode".to_owned(), "accept-edits".to_owned()])
+        );
+        assert_eq!(
+            gemini.permission_args.get(&Permissions::WriteShell),
+            Some(&vec!["--dangerously-skip-permissions".to_owned()])
         );
 
         let claude = config.profile("claude").unwrap();

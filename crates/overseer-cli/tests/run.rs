@@ -359,4 +359,8 @@ async fn init_writes_the_routing_profiles_with_comments() {
     assert!(text.contains("name = \"gemini\""), "{text}");
     assert!(text.contains("name = \"opencode-local\""), "{text}");
     assert!(text.contains("# Untested example"), "{text}");
+    assert!(
+        text.contains("agy must be signed in (run `agy` once interactively)"),
+        "{text}"
+    );
 }
