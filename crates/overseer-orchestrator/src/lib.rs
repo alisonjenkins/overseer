@@ -23,7 +23,7 @@ pub use review::{
 };
 pub use router::{RouterError, plan_attempts};
 pub use runner::{
-    RunSummary, RunnerError, continue_task, continue_task_with_backend,
+    RunSummary, RunnerError, build_system_prompt, continue_task, continue_task_with_backend,
     continue_task_with_backends, run_task, run_task_with_backend,
 };
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};

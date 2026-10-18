@@ -511,7 +511,14 @@ async fn run_reviewer_attempt(
         };
 
         let transcript_path = match write_transcript(
-            state_dir, run_id, task, profile, branch, prompt, &attempt,
+            state_dir,
+            run_id,
+            task,
+            profile,
+            branch,
+            prompt,
+            &attempt,
+            profile.role_prompt.as_deref(),
         )
         .await
         {

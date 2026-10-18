@@ -385,8 +385,9 @@ async fn execute(
             );
             continue;
         }
+        let (system_prompt, skills_record) = build_system_prompt(state_dir, profile);
         let run_id = store
-            .start_run(task_id, &profile.name, None)
+            .start_run(task_id, &profile.name, skills_record.as_deref())
             .map_err(store_step("start run"))?;
 
         let mut attempt = match &worktree {
@@ -397,7 +398,17 @@ async fn execute(
                     worktree::discard_changes(&worktree.path).await
                 };
                 match ready {
-                    Ok(()) => run_in_worktree(backend, profile, &task, worktree, &prompt).await,
+                    Ok(()) => {
+                        run_in_worktree(
+                            backend,
+                            profile,
+                            &task,
+                            worktree,
+                            &prompt,
+                            system_prompt.clone(),
+                        )
+                        .await
+                    }
                     Err(err) => Attempt::failed(FailureKind::Other(format!("discard: {err}"))),
                 }
             }
@@ -405,7 +416,14 @@ async fn execute(
         };
 
         let transcript_path = match write_transcript(
-            state_dir, run_id, &task, profile, &branch, &prompt, &attempt,
+            state_dir,
+            run_id,
+            &task,
+            profile,
+            &branch,
+            &prompt,
+            &attempt,
+            system_prompt.as_deref(),
         )
         .await
         {
@@ -502,9 +520,10 @@ async fn run_in_worktree(
     task: &Task,
     worktree: &Worktree,
     prompt: &str,
+    system: Option<String>,
 ) -> Attempt {
     let request = RunRequest {
-        system: profile.role_prompt.clone(),
+        system,
         prompt: prompt.to_owned(),
         workdir: worktree.path.clone(),
         permissions: profile.permissions,
@@ -537,6 +556,47 @@ async fn run_in_worktree(
     attempt
 }
 
+/// Build the effective system prompt for a profile by appending its configured
+/// skills, and format the active skill versions for the run row.
+pub fn build_system_prompt(
+    state_dir: &Path,
+    profile: &Profile,
+) -> (Option<String>, Option<String>) {
+    let skills_dir = state_dir.join("skills");
+    let mut system = profile.role_prompt.clone();
+    let mut active_versions = Vec::new();
+
+    for skill_name in &profile.skills {
+        match overseer_store::skills::read_current_skill(&skills_dir, skill_name) {
+            Ok(Some((version, content))) => {
+                active_versions.push(format!("{skill_name}:v{version}"));
+                match &mut system {
+                    Some(prev) => {
+                        prev.push_str(&format!("\n\n## Skill: {skill_name}\n{content}"));
+                    }
+                    None => {
+                        system = Some(format!("## Skill: {skill_name}\n{content}"));
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(skill = %skill_name, "skill not found on disk");
+            }
+            Err(err) => {
+                tracing::warn!(skill = %skill_name, %err, "failed to read skill");
+            }
+        }
+    }
+
+    let skills_record = if active_versions.is_empty() {
+        None
+    } else {
+        Some(active_versions.join(","))
+    };
+
+    (system, skills_record)
+}
+
 fn build_prompt(task: &Task) -> String {
     let heading = format!("Task {}: {}", task.id, task.title);
     if task.body.trim().is_empty() {
@@ -551,6 +611,7 @@ fn commit_message(task: &Task) -> String {
 }
 
 /// Write the transcript atomically: temp file, then rename.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_transcript(
     state_dir: &Path,
     run_id: RunId,
@@ -559,12 +620,13 @@ pub(crate) async fn write_transcript(
     branch: &str,
     prompt: &str,
     attempt: &Attempt,
+    system: Option<&str>,
 ) -> Result<PathBuf, std::io::Error> {
     let dir = state_dir.join("runs");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("{run_id}.md"));
     let tmp = dir.join(format!("{run_id}.md.tmp"));
-    let body = render_transcript(run_id, task, profile, branch, prompt, attempt);
+    let body = render_transcript(run_id, task, profile, branch, prompt, attempt, system);
     tokio::fs::write(&tmp, body).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(path)
@@ -577,13 +639,14 @@ fn render_transcript(
     branch: &str,
     prompt: &str,
     attempt: &Attempt,
+    system: Option<&str>,
 ) -> String {
     let failure = attempt
         .failure
         .as_ref()
         .map_or_else(|| "none".to_owned(), ToString::to_string);
     let commit = attempt.commit.as_deref().unwrap_or("none");
-    let system = profile.role_prompt.as_deref().unwrap_or("(none)");
+    let system = system.unwrap_or("(none)");
     format!(
         "# Run {run_id}: task {task_id}\n\n\
          - profile: {profile_name}\n\
@@ -813,6 +876,37 @@ mod tests {
         assert_eq!(requests[0].prompt, "Task 1: write tests\n\ncover the lexer");
         assert_eq!(requests[0].permissions, Permissions::WriteWorkdir);
         assert!(requests[0].workdir.ends_with("worktrees/task-1"));
+    }
+
+    #[tokio::test]
+    async fn prompt_carries_injected_skills_and_records_on_run_row() {
+        let mut fx = fixture();
+        overseer_store::skills::create_next_version(
+            &fx.state.join("skills"),
+            "rust-guidelines",
+            "Prefer iterators over loops.",
+        )
+        .unwrap();
+
+        let mut cfg = config(&fx.repo);
+        cfg.profiles[0].skills = vec!["rust-guidelines".to_owned(), "nonexistent-skill".to_owned()];
+        let task = add(&mut fx.store, "write tests", "cover the lexer");
+        let backend = MockBackend::answering("ok");
+
+        let _summary = run_task_with_backend(&mut fx.store, &cfg, &fx.state, task, &backend)
+            .await
+            .unwrap();
+
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].system.as_deref(),
+            Some("You are careful.\n\n## Skill: rust-guidelines\nPrefer iterators over loops.")
+        );
+
+        let runs = fx.store.list_runs(task).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].skills.as_deref(), Some("rust-guidelines:v1"));
     }
 
     #[tokio::test]
