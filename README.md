@@ -114,11 +114,36 @@ permissions = "write-workdir"   # ceiling: read, write-workdir or write-shell
 timeout_secs = 1500
 ```
 
-The `openai` backend sends one non-streaming request per run. A system message
-comes from `role_prompt`, then the task title and body as the user message.
-Only `message.content` is kept; `reasoning_content` is ignored. A chat-completions
-backend returns text only and does not edit files. Use a `command` profile for
-work that must change files.
+The `openai` backend sends non-streaming requests to any OpenAI-compatible server.
+A system message comes from `role_prompt`, followed by the task title and body as
+the user message. Only `message.content` is kept; `reasoning_content` is ignored.
+
+When `agent_tools = false` (the default), the backend sends a single request and
+returns text only without editing files.
+
+### Agent tool loop (`agent_tools = true`)
+
+When `agent_tools = true`, the `openai` backend runs a multi-turn agent tool loop
+over the task worktree. It provides OpenAI-compatible function tools described by
+JSON Schema, confined strictly to the worktree root:
+
+- `list_dir(path)`: lists directory entries, omitting `.git`.
+- `read_file(path, offset?, limit?)`: reads lines with line numbers, capped to 400
+  lines and 20 KB per call, appending a truncation notice when truncated.
+- `write_file(path, content)`: creates parent directories and writes/overwrites
+  file content (offered when effective permissions are at least `write-workdir`).
+- `replace_in_file(path, old, new)`: replaces text that occurs exactly once in the
+  file, failing with an explanatory message otherwise (requires at least `write-workdir`).
+- `run_command(command)`: executes `sh -c` in the worktree with a 120-second timeout,
+  combined stdout and stderr truncated to 8 KB, and cleared environment except
+  `PATH` and `HOME=<workdir>` (offered only when effective permissions are `write-shell`).
+
+All paths are resolved relative to the worktree. Escaping via `..`, absolute paths
+outside the worktree, symlinks targeting outside the worktree, and any access
+touching `.git` are rejected with `error:` messages returned to the model.
+The loop executes each tool call, feeds the result back as a `tool` role message,
+sums token usage across steps, and finishes when the model produces a final answer
+without tool calls. If the loop exceeds `max_steps` (default 40), the run fails.
 
 ### Command profiles (harness CLIs)
 
@@ -146,6 +171,9 @@ installed version before relying on them; the test suite does not run them.
 
 - `local`: the default profile, an `openai` server on `127.0.0.1:8080`. A
   chat-only profile that returns text and cannot edit files.
+- `local-edit`: an `openai` profile on `127.0.0.1:8080` with `agent_tools = true`,
+  `max_steps = 40`, and `permissions = "write-workdir"`. Requires a llama-server
+  started with tool calling (`--jinja`) and a tool-capable chat template.
 - `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with
   `permissions = "write-shell"` (`--dangerously-skip-permissions`). Falls back
   to `local-agent`.
@@ -236,6 +264,8 @@ warning. The remaining metered profiles in that task's plan are then skipped.
 | `permission_args` | table: level to array of strings | `{}` | Extra argv per effective permission level, before the prompt; substitutes `{workdir}`. |
 | `metered` | bool | `false` | Spends paid credits. Skipped in credits-low mode. |
 | `timeout_secs` | integer | `1500` | Seconds before an attempt is killed. |
+| `agent_tools` | bool | `false` | Run an agent tool loop instead of a single request (`openai` backend only). |
+| `max_steps` | integer | `40` | Maximum number of tool iterations before the run fails. |
 
 Configs are validated on load: unknown keys, duplicate names, unknown
 `default_profile` or `fallback` names, and fallback cycles are all rejected.
