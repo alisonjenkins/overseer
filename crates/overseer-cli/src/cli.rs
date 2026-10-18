@@ -50,6 +50,8 @@ pub enum Command {
         /// Id of the task to merge.
         id: i64,
     },
+    /// Sync tasks from the configured sources.
+    Sync,
     /// Land a reviewed task branch by pushing to remote and opening a PR.
     Land {
         /// Id of the task to land.

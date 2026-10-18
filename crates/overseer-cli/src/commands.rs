@@ -6,8 +6,8 @@ use overseer_core::{
     BackendKind, Config, Lesson, LessonId, LessonStatus, NewTask, Run, Task, TaskId, TaskStatus,
 };
 use overseer_orchestrator::{
-    RunSummary, ShutdownSignal, WorkerError, WorkerLockError, WorkerOptions, check_worker_status,
-    doctor_report,
+    RunSummary, ShutdownSignal, SourceBuildError, SyncError, WorkerError, WorkerLockError,
+    WorkerOptions, build_sources, check_worker_status, doctor_report, sync_sources,
 };
 
 use crate::cli::{
@@ -52,6 +52,18 @@ impl From<anyhow::Error> for CliError {
 
 impl From<overseer_store::StoreError> for CliError {
     fn from(err: overseer_store::StoreError) -> Self {
+        Self::Other(err.into())
+    }
+}
+
+impl From<SourceBuildError> for CliError {
+    fn from(err: SourceBuildError) -> Self {
+        Self::Other(err.into())
+    }
+}
+
+impl From<SyncError> for CliError {
+    fn from(err: SyncError) -> Self {
         Self::Other(err.into())
     }
 }
@@ -106,6 +118,7 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         }
         Command::Diff { id, stat } => run_diff(&dir, id, stat),
         Command::Merge { id } => run_merge(&dir, id),
+        Command::Sync => run_sync(&dir),
         Command::Land { id } => run_land(&dir, id),
         Command::Discard { id } => run_discard(&dir, id),
         Command::Review { id } => run_review(&dir, id),
@@ -238,6 +251,30 @@ fn run_merge(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
         .set_status(task_id, TaskStatus::Done)
         .context("failed to set task status to done")?;
     println!("{sha}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_sync(dir: &Path) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+
+    if config.sources.is_empty() {
+        println!("no sources configured");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let sources = build_sources(&config)?;
+    let report = sync_sources(&mut store, &sources)?;
+
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    println!(
+        "sync: added {}, updated {}, cancelled {}, revived {}",
+        report.added, report.updated, report.cancelled, report.revived
+    );
+
     Ok(ExitCode::SUCCESS)
 }
 
