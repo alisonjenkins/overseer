@@ -1034,10 +1034,12 @@ dependencies = [
  "overseer-core",
  "overseer-orchestrator",
  "overseer-store",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
