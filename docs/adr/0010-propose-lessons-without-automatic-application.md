@@ -9,7 +9,7 @@ This decision is recorded retrospectively on 2026-10-18T00:00:00Z to govern auto
 
 ## Decision
 
-Retrospectives analyze completed runs that exhibited learning signals (such as reworks or failures) and propose improvements as structured lesson files in `lessons/<id>.md` and `lessons/<id>.diff`. Lessons are stored in SQLite with status `Proposed`. Operators review proposed lessons and decide whether to apply or reject them via `overseer lessons apply` or `overseer lessons reject`. Skills are versioned per profile, and each run row records the exact skill versions active during execution.
+Retrospectives analyze completed runs that exhibited learning signals (such as reworks or failures) and propose improvements as structured lesson files in `lessons/<id>.md` and `lessons/<id>.diff`. Lessons are stored in SQLite with status `proposed`. Operators review proposed lessons and decide whether to apply or reject them via `overseer lessons apply` or `overseer lessons reject`. Applying a lesson is refused unless the skill's current version still matches the lesson's base version. Skills are versioned globally under `<state-dir>/skills/<name>/v<N>.md`, referenced by profiles, and each run row records the skill versions active during execution.
 
 ## Consequences
 

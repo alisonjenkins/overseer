@@ -9,7 +9,7 @@ This decision is recorded retrospectively on 2026-10-18T00:00:00Z to resolve dea
 
 ## Decision
 
-When a reviewer emits `VERDICT: ESCALATE`, the orchestrator extracts the first feedback bullet and stores it as the task reason formatted as `escalation: reviewer: <bullet>`. The `overseer approve` command validates that the task is in `needs-human` with an escalation reason, marks the task approved, and transitions it back to `review` status with an `approved: ...` reason prefix so landing can proceed.
+When a reviewer emits `VERDICT: ESCALATE`, the orchestrator extracts the first feedback bullet and stores it as the task reason formatted as `escalation: reviewer: <bullet>`. The `overseer approve` command validates that the task is in `needs-human` with an escalation reason, marks the task approved, and transitions it back to `review` status with an `approved: ...` reason prefix so landing can proceed. Both reviewer ESCALATE verdicts and rework-limit exhaustion record such a reason.
 
 ## Consequences
 

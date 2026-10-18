@@ -9,7 +9,7 @@ This decision is recorded retrospectively on 2026-10-18T00:00:00Z to document ta
 
 ## Decision
 
-Each task executes in its own dedicated git worktree located at `worktrees/task-<id>` on a branch named `overseer/task-<id>`. The orchestrator manages worktree creation from HEAD and cleans up worktrees upon merge or discard. When `overseer discard` is invoked on a review or blocked task, the orchestrator removes the worktree, deletes the task branch, and resets the task status to backlog.
+Each task executes in its own dedicated git worktree located at `<state-dir>/worktrees/task-<id>` on a branch named `overseer/task-<id>`. Overseer removes the worktree and branch on `overseer merge` and `overseer discard`. Tasks finished by `overseer land` with `auto_merge` or by `reconcile` keep their worktree and branch on disk; removing them is not yet implemented. When `overseer discard` is invoked on a review or blocked task, the orchestrator removes the worktree, deletes the task branch, and resets the task status to backlog.
 
 ## Consequences
 

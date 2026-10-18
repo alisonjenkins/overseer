@@ -9,7 +9,7 @@ This decision is recorded retrospectively on 2026-10-18T00:00:00Z to document ba
 
 ## Decision
 
-Model backends implement a unified `Backend` trait supporting OpenAI-compatible HTTP endpoints and external command-line harnesses, with health checks for reachability and authentication. Chat-only backends do not edit files; file-modifying tasks must use harness CLIs or enable the worktree-confined tool loop in the OpenAI backend. Each profile defines an ordered `fallback` chain of profile names. When a run fails with quota exhaustion, authentication failure, or unreachable status, the router falls back to the next profile, automatically enabling `credits_low` mode on metered quota exhaustion to bypass credit-consuming routes.
+Model backends implement a unified `Backend` trait supporting OpenAI-compatible HTTP endpoints and external command-line harnesses, accompanied by health check functions for reachability and authentication. Chat-only backends do not edit files; file-modifying tasks must use harness CLIs or enable the worktree-confined tool loop in the OpenAI backend. Each profile defines an ordered `fallback` chain of profile names. When a run fails with quota exhaustion, authentication failure, or unreachable status, the runner falls back to the next profile, automatically enabling `credits_low` mode on metered quota exhaustion to bypass credit-consuming routes. Other failures, such as a timeout or an empty output, abort the fallback chain and block the task.
 
 ## Consequences
 
