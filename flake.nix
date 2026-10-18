@@ -53,6 +53,29 @@
         }
       );
 
+      apps = forAllSystems (
+        system:
+        let
+          pkg = self.packages.${system}.default;
+        in
+        {
+          default = {
+            type = "app";
+            program = "${pkg}/bin/${pkg.meta.mainProgram}";
+            meta = pkg.meta;
+          };
+          overseer = {
+            type = "app";
+            program = "${pkg}/bin/${pkg.meta.mainProgram}";
+            meta = pkg.meta;
+          };
+        }
+      );
+
+      overlays.default = final: prev: {
+        overseer = self.packages.${final.stdenv.hostPlatform.system}.default;
+      };
+
       devShells = forAllSystems (
         system:
         let
