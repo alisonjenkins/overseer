@@ -151,6 +151,7 @@ impl Store {
         })
     }
 
+    /// Get a task by its id.
     pub fn get_task(&self, id: TaskId) -> Result<Task, StoreError> {
         let mut task = self
             .conn
