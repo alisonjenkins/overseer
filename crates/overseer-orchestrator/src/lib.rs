@@ -4,6 +4,7 @@
 pub mod doctor;
 mod lock;
 mod recovery;
+mod review;
 mod router;
 mod runner;
 mod worker;
@@ -15,6 +16,7 @@ mod test_support;
 pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
 pub use lock::{WorkerLock, WorkerLockError, check_worker_status};
 pub use recovery::{RecoveryError, recover_interrupted};
+pub use review::{ReviewOutcome, aggregate_verdicts, build_reviewer_prompt, overall_verdict};
 pub use router::{RouterError, plan_attempts};
 pub use runner::{RunSummary, RunnerError, run_task, run_task_with_backend};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
