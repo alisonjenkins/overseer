@@ -1,6 +1,7 @@
 //! Runs a task end to end: claims it, prepares a worktree and branch, calls
 //! the backend, records the run, commits the result and sets the task status.
 
+pub mod doctor;
 mod lock;
 mod recovery;
 mod router;
@@ -11,6 +12,7 @@ mod worktree;
 #[cfg(test)]
 mod test_support;
 
+pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
 pub use lock::{WorkerLock, WorkerLockError, check_worker_status};
 pub use recovery::{RecoveryError, recover_interrupted};
 pub use router::{RouterError, plan_attempts};
