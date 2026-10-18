@@ -118,6 +118,92 @@ pub async fn create(
     let path = worktree_path(state_dir, task_id);
     let branch = branch_name(task_id);
     let path_text = path.to_string_lossy().into_owned();
+
+    let path_exists = path.exists();
+    let is_registered = path_exists && is_registered_worktree(repo, &path).await;
+    if is_registered {
+        let status = git(&path, &["status", "--porcelain"]).await?;
+        if !status.trim().is_empty() {
+            return Err(WorktreeError::GitFailed {
+                command: format!("worktree add -b {branch} {path_text} HEAD"),
+                stderr: format!(
+                    "worktree {path_text} has uncommitted changes; inspect or discard it before retrying"
+                ),
+            });
+        }
+    }
+
+    let registered_wt = find_worktree_for_branch(repo, &branch).await;
+    if let Some(ref wt) = registered_wt
+        && wt.exists()
+        && wt != &path
+    {
+        let status = git(wt, &["status", "--porcelain"]).await?;
+        if !status.trim().is_empty() {
+            let wt_text = wt.to_string_lossy().into_owned();
+            return Err(WorktreeError::GitFailed {
+                command: format!("worktree add -b {branch} {path_text} HEAD"),
+                stderr: format!(
+                    "worktree {wt_text} has uncommitted changes; inspect or discard it before retrying"
+                ),
+            });
+        }
+    }
+
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists = git(repo, &["rev-parse", "--verify", &branch_ref])
+        .await
+        .is_ok();
+
+    if branch_exists {
+        let range = format!("HEAD..{branch}");
+        let count_output = git(repo, &["rev-list", "--count", &range]).await?;
+        let count: usize = count_output
+            .trim()
+            .parse()
+            .map_err(|_| WorktreeError::GitFailed {
+                command: format!("rev-list --count {range}"),
+                stderr: format!("unexpected count output: {count_output}"),
+            })?;
+        if count > 0 {
+            return Err(WorktreeError::GitFailed {
+                command: format!("worktree add -b {branch} {path_text} HEAD"),
+                stderr: format!(
+                    "branch {branch} has {count} commits not on HEAD; inspect or discard it before retrying"
+                ),
+            });
+        }
+    }
+
+    if path_exists {
+        if is_registered {
+            remove_worktree(repo, &path).await?;
+        } else {
+            let _ = remove_worktree(repo, &path).await;
+            if path.exists() {
+                tokio::fs::remove_dir_all(&path).await.map_err(|source| {
+                    WorktreeError::CreateDirectory {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+            }
+        }
+    }
+
+    if let Some(target_wt) = registered_wt {
+        if target_wt.exists() && target_wt != path {
+            remove_worktree(repo, &target_wt).await?;
+        } else if !target_wt.exists() {
+            let _ = git(repo, &["worktree", "prune"]).await;
+        }
+    }
+
+    if branch_exists {
+        git(repo, &["branch", "-D", &branch]).await?;
+        tracing::info!("removed empty branch {branch} left by an earlier attempt");
+    }
+
     let head_commit = git(repo, &["rev-parse", "HEAD"])
         .await
         .ok()
@@ -487,6 +573,20 @@ async fn find_worktree_for_branch(repo: &Path, branch: &str) -> Option<PathBuf> 
     None
 }
 
+async fn is_registered_worktree(repo: &Path, path: &Path) -> bool {
+    let Ok(output) = git(repo, &["worktree", "list", "--porcelain"]).await else {
+        return false;
+    };
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    output
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|wt| {
+            let p = PathBuf::from(wt.trim());
+            p.canonicalize().unwrap_or_else(|_| p.clone()) == target || p == path
+        })
+}
+
 async fn git(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let command = args.join(" ");
     let output = Command::new("git")
@@ -643,16 +743,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creating_a_worktree_twice_is_a_git_failure() {
+    async fn creation_removes_empty_leftover_branch() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
         let state = root.path().join("state");
-        create(&repo, &state, TaskId::new(5)).await.unwrap();
+
+        git_sync(&repo, &["branch", "overseer/task-5"]);
+
+        let worktree = create(&repo, &state, TaskId::new(5)).await.unwrap();
+        assert_eq!(worktree.branch, "overseer/task-5");
+        assert_eq!(worktree.path, state.join("worktrees").join("task-5"));
+        assert!(worktree.path.join("README.md").is_file());
+
+        let worktree2 = create(&repo, &state, TaskId::new(5)).await.unwrap();
+        assert_eq!(worktree2.branch, "overseer/task-5");
+        assert_eq!(worktree2.path, state.join("worktrees").join("task-5"));
+        assert!(worktree2.path.join("README.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn creation_keeps_branch_with_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+
+        git_sync(&repo, &["checkout", "-b", "overseer/task-5"]);
+        std::fs::write(repo.join("work.txt"), "task work\n").unwrap();
+        git_sync(&repo, &["add", "-A"]);
+        git_sync(&repo, &["commit", "-m", "task 5 work"]);
+        let branch_commit = git_sync(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        git_sync(&repo, &["checkout", "main"]);
 
         let err = create(&repo, &state, TaskId::new(5)).await.unwrap_err();
-        assert!(matches!(err, WorktreeError::GitFailed { .. }), "{err:?}");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("1 commits not on HEAD"),
+            "expected error to mention commit count, got: {err_msg}"
+        );
+
+        let current = git_sync(&repo, &["rev-parse", "refs/heads/overseer/task-5"])
+            .trim()
+            .to_owned();
+        assert_eq!(current, branch_commit);
     }
 
     #[tokio::test]
