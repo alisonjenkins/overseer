@@ -24,11 +24,22 @@ pub fn git_sync(dir: &Path, args: &[&str]) -> String {
 /// Initialise `dir` as a repository on `main` with one commit containing
 /// `README.md`. `dir` must already exist.
 pub fn init_repo(dir: &Path) {
+    init_git(dir);
+    std::fs::write(dir.join("README.md"), "base\n").unwrap();
+    git_sync(dir, &["add", "-A"]);
+    git_sync(dir, &["commit", "-q", "-m", "initial"]);
+}
+
+/// Initialise `dir` as a repository on `main` whose only commit is empty, so
+/// its tree tracks no files. `dir` must already exist.
+pub fn init_empty_repo(dir: &Path) {
+    init_git(dir);
+    git_sync(dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+}
+
+fn init_git(dir: &Path) {
     git_sync(dir, &["init", "-q", "-b", "main"]);
     git_sync(dir, &["config", "user.name", "Overseer Test"]);
     git_sync(dir, &["config", "user.email", "test@example.invalid"]);
     git_sync(dir, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(dir.join("README.md"), "base\n").unwrap();
-    git_sync(dir, &["add", "-A"]);
-    git_sync(dir, &["commit", "-q", "-m", "initial"]);
 }

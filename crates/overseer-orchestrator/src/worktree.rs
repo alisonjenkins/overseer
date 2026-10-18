@@ -81,7 +81,7 @@ pub async fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>
 /// Drop every uncommitted change in `worktree`, tracked and untracked, so the
 /// next attempt starts from the task branch's last commit.
 pub async fn discard_changes(worktree: &Path) -> Result<(), WorktreeError> {
-    git(worktree, &["checkout", "--", "."]).await?;
+    git(worktree, &["reset", "--hard", "HEAD"]).await?;
     git(worktree, &["clean", "-fd"]).await?;
     Ok(())
 }
@@ -120,7 +120,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::test_support::{git_sync, init_repo};
+    use crate::test_support::{git_sync, init_empty_repo, init_repo};
 
     #[test]
     fn branch_and_path_names_follow_the_task_id() {
@@ -192,6 +192,43 @@ mod tests {
 
         assert_eq!(sha, None);
         assert_eq!(git_sync(&worktree.path, &["rev-parse", "HEAD"]), before);
+    }
+
+    #[tokio::test]
+    async fn discard_changes_in_a_repo_with_an_empty_tree_removes_untracked_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_empty_repo(&repo);
+        let worktree = create(&repo, &root.path().join("state"), TaskId::new(6))
+            .await
+            .unwrap();
+        std::fs::write(worktree.path.join("scratch.txt"), "attempt output\n").unwrap();
+
+        discard_changes(&worktree.path).await.unwrap();
+
+        assert!(!worktree.path.join("scratch.txt").exists());
+        let status = git_sync(&worktree.path, &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn discard_changes_restores_tracked_files_and_removes_untracked_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = create(&repo, &root.path().join("state"), TaskId::new(7))
+            .await
+            .unwrap();
+        std::fs::write(worktree.path.join("README.md"), "half-written\n").unwrap();
+        std::fs::write(worktree.path.join("scratch.txt"), "attempt output\n").unwrap();
+
+        discard_changes(&worktree.path).await.unwrap();
+
+        let readme = std::fs::read_to_string(worktree.path.join("README.md")).unwrap();
+        assert_eq!(readme, "base\n");
+        assert!(!worktree.path.join("scratch.txt").exists());
     }
 
     #[tokio::test]
