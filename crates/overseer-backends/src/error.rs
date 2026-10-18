@@ -16,13 +16,6 @@ pub enum BackendError {
     #[error("working directory {path} does not exist")]
     MissingWorkdir { path: std::path::PathBuf },
 
-    #[error("failed to start command {program:?}")]
-    SpawnCommand {
-        program: String,
-        #[source]
-        source: std::io::Error,
-    },
-
     #[error("mock backend has no scripted outcome left for this call")]
     MockExhausted,
 

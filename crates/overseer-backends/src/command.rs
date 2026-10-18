@@ -1,14 +1,36 @@
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use overseer_core::{FailureKind, Profile, RunOutcome, RunRequest, Usage};
+use overseer_core::{FailureKind, Permissions, Profile, RunOutcome, RunRequest, Usage};
 use tokio::io::AsyncWriteExt;
 
 use crate::{Backend, BackendError, failed, tail};
 
 /// How many characters of stderr are kept in the failure message.
 const STDERR_EXCERPT_CHARS: usize = 500;
+
+/// Output phrases that mean the harness needs a fresh login or key.
+const AUTH_PHRASES: [&str; 5] = [
+    "authentication required",
+    "not logged in",
+    "please run /login",
+    "invalid api key",
+    "unauthorized",
+];
+
+/// Output phrases that mean the account has run out of quota or credits.
+const QUOTA_PHRASES: [&str; 8] = [
+    "quota",
+    "rate limit",
+    "usage limit",
+    "credit balance is too low",
+    "out of credits",
+    "resource exhausted",
+    "429",
+    "limit reached",
+];
 
 /// Runs an external program (a harness CLI such as `opencode run` or
 /// `agy -p`, or any other tool) in the task worktree.
@@ -23,6 +45,8 @@ pub struct CommandBackend {
     args: Vec<String>,
     prompt_stdin: bool,
     timeout: Duration,
+    ceiling: Permissions,
+    permission_args: BTreeMap<Permissions, Vec<String>>,
 }
 
 impl CommandBackend {
@@ -42,6 +66,8 @@ impl CommandBackend {
             args: args.to_vec(),
             prompt_stdin: profile.prompt_stdin,
             timeout: Duration::from_secs(profile.timeout_secs),
+            ceiling: profile.permissions,
+            permission_args: profile.permission_args.clone(),
         })
     }
 }
@@ -59,9 +85,11 @@ impl Backend for CommandBackend {
             None => req.prompt.clone(),
         };
 
+        let effective = self.ceiling.min(req.permissions);
         let mut command = tokio::process::Command::new(&self.program);
         command
             .args(&self.args)
+            .args(self.permission_args.get(&effective).into_iter().flatten())
             .current_dir(&req.workdir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -75,19 +103,14 @@ impl Backend for CommandBackend {
 
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(source) => {
                 tracing::warn!(
                     profile = %self.profile_name,
                     program = %self.program,
-                    "command backend program not found"
+                    error = %source,
+                    "command backend could not start its program"
                 );
                 return Ok(failed(FailureKind::Unreachable));
-            }
-            Err(source) => {
-                return Err(BackendError::SpawnCommand {
-                    program: self.program.clone(),
-                    source,
-                });
             }
         };
 
@@ -124,26 +147,38 @@ impl Backend for CommandBackend {
 
 fn classify(output: &std::process::Output) -> RunOutcome {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if output.status.success() {
-        return RunOutcome {
-            output: stdout,
-            usage: Usage::default(),
-            failure: None,
-        };
-    }
-    let code = output
-        .status
-        .code()
-        .map_or_else(|| "signal".to_owned(), |code| code.to_string());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let failure = if output.status.success() && !stdout.trim().is_empty() {
+        None
+    } else {
+        Some(classify_failure(&stdout, &stderr, output.status.code()))
+    };
     RunOutcome {
         output: stdout,
         usage: Usage::default(),
-        failure: Some(FailureKind::Other(format!(
-            "exit {code}: {}",
-            tail(&stderr, STDERR_EXCERPT_CHARS)
-        ))),
+        failure,
     }
+}
+
+/// Decide why a command run failed from what it printed. Phrase matches win
+/// over the exit code, so a quota message is routable even when the program
+/// exits non-zero with a generic status.
+fn classify_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> FailureKind {
+    let haystack = format!("{stdout}\n{stderr}").to_lowercase();
+    if AUTH_PHRASES.iter().any(|phrase| haystack.contains(phrase)) {
+        return FailureKind::AuthRequired;
+    }
+    if QUOTA_PHRASES.iter().any(|phrase| haystack.contains(phrase)) {
+        return FailureKind::QuotaExhausted;
+    }
+    if exit_code == Some(0) && stdout.trim().is_empty() {
+        return FailureKind::Other("empty output".to_owned());
+    }
+    let code = exit_code.map_or_else(|| "signal".to_owned(), |code| code.to_string());
+    FailureKind::Other(format!(
+        "exit {code}: {}",
+        tail(stderr, STDERR_EXCERPT_CHARS)
+    ))
 }
 
 #[cfg(test)]
@@ -155,6 +190,7 @@ mod tests {
 
     use overseer_core::{BackendKind, Permissions};
 
+    use super::FailureKind::{AuthRequired, Other, QuotaExhausted};
     use super::*;
 
     fn profile(argv: &[&str], prompt_stdin: bool, timeout_secs: u64) -> Profile {
@@ -306,5 +342,144 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn permission_args_for_the_effective_level_go_before_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = profile(
+            &[
+                "/bin/sh",
+                "-c",
+                "for a in \"$@\"; do printf '[%s]' \"$a\"; done",
+                "sh",
+            ],
+            false,
+            10,
+        );
+        agent.permission_args.insert(
+            Permissions::WriteWorkdir,
+            vec!["--mode".to_owned(), "accept-edits".to_owned()],
+        );
+        let backend = CommandBackend::new(&agent).unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "fix it"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, "[--mode][accept-edits][fix it]");
+    }
+
+    #[tokio::test]
+    async fn permission_args_are_clamped_to_the_profile_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = profile(
+            &[
+                "/bin/sh",
+                "-c",
+                "for a in \"$@\"; do printf '[%s]' \"$a\"; done",
+                "sh",
+            ],
+            false,
+            10,
+        );
+        agent.permissions = Permissions::WriteWorkdir;
+        agent
+            .permission_args
+            .insert(Permissions::WriteShell, vec!["--yes".to_owned()]);
+        let backend = CommandBackend::new(&agent).unwrap();
+        let mut req = request(dir.path().to_path_buf(), None, "p");
+        req.permissions = Permissions::WriteShell;
+        let outcome = backend.run(&req).await.unwrap();
+        assert_eq!(
+            outcome.output, "[p]",
+            "write-shell args must not leak past the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_executable_program_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("not-executable");
+        std::fs::write(&program, "#!/bin/sh\necho hi\n").unwrap();
+        let program = program.to_string_lossy().into_owned();
+        let backend = CommandBackend::new(&profile(&[program.as_str()], false, 10)).unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "x"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, Some(FailureKind::Unreachable));
+    }
+
+    #[test]
+    fn classify_failure_maps_known_phrases_case_insensitively() {
+        let cases = [
+            ("", "Error: Authentication Required", AuthRequired),
+            ("", "You are NOT LOGGED IN", AuthRequired),
+            ("Please run /login to continue", "", AuthRequired),
+            ("", "Invalid API Key", AuthRequired),
+            ("", "401 Unauthorized", AuthRequired),
+            ("", "Quota exceeded for this month", QuotaExhausted),
+            ("", "Rate Limit reached", QuotaExhausted),
+            ("", "your usage limit was hit", QuotaExhausted),
+            ("", "Credit balance is too low", QuotaExhausted),
+            ("", "you are out of credits", QuotaExhausted),
+            ("", "Resource Exhausted", QuotaExhausted),
+            ("", "HTTP 429 Too Many Requests", QuotaExhausted),
+            ("", "monthly limit reached", QuotaExhausted),
+        ];
+        for (stdout, stderr, expected) in cases {
+            assert_eq!(
+                classify_failure(stdout, stderr, Some(1)),
+                expected,
+                "stdout {stdout:?}, stderr {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_failure_keeps_other_failures_with_exit_code_and_stderr() {
+        assert_eq!(
+            classify_failure("", "segfault", Some(139)),
+            Other("exit 139: segfault".to_owned())
+        );
+        assert_eq!(
+            classify_failure("", "bad flag", None),
+            Other("exit signal: bad flag".to_owned())
+        );
+    }
+
+    #[test]
+    fn exit_zero_with_empty_output_is_an_other_failure() {
+        assert_eq!(
+            classify_failure("  \n", "", Some(0)),
+            Other("empty output".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_zero_with_empty_output_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = CommandBackend::new(&profile(&["/bin/sh", "-c", "true"], false, 10)).unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "x"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, Some(Other("empty output".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn quota_message_on_stderr_is_quota_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = CommandBackend::new(&profile(
+            &["/bin/sh", "-c", "echo 'rate limit hit' >&2; exit 1"],
+            false,
+            10,
+        ))
+        .unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "x"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, Some(QuotaExhausted));
     }
 }
