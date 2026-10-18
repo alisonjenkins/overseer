@@ -53,6 +53,8 @@ impl Store {
         Self::from_connection(conn)
     }
 
+    /// Opens an in-memory database and runs migrations.
+    /// Returns a `StoreError` on failure.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn =
             Connection::open_in_memory().map_err(|source| StoreError::OpenInMemory { source })?;
