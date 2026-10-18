@@ -127,6 +127,15 @@ the last argument, or stdin when `prompt_stdin = true`. A role prompt is put
 ahead of the task text, since a plain argv has no system channel. Command
 backends report no token usage, so `run` shows zeros for them.
 
+Before spawning, every `command` element and every `permission_args` element
+substitutes `{workdir}` (as a whole argument or substring) with the absolute
+path of the run worktree. A leading `~/` in `command[0]` expands to `$HOME`.
+
+Environment variables for the spawned process can be set with `env` (a table of
+string key-value pairs). They are set on the child process only, without
+modifying the parent environment. Keys must be non-empty and contain no `=`.
+Values are plain strings, not secrets.
+
 A command profile's `permission_args` lists extra arguments per permission level
 (`read`, `write-workdir`, `write-shell`). They go before the prompt, for the
 level the run actually gets, which is the lower of what was asked and the
@@ -135,13 +144,16 @@ profile's `permissions` ceiling.
 `overseer init` writes these profiles. Check each tool's flags against your
 installed version before relying on them; the test suite does not run them.
 
-- `local`: the default profile, an `openai` server on `127.0.0.1:8080`.
+- `local`: the default profile, an `openai` server on `127.0.0.1:8080`. A
+  chat-only profile that returns text and cannot edit files.
 - `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with
   `permissions = "write-shell"` (`--dangerously-skip-permissions`). Falls back
-  to `local`.
+  to `local-agent`.
 - `claude`: `claude -p`, `metered = true`, with `--permission-mode` flags.
-  Falls back to `gemini`, then `local`.
-- `opencode-local`: `opencode run`. Untested example, not in any fallback chain.
+  Falls back to `gemini`, then `local-agent`.
+- `local-agent`: runs the active local llama.cpp profile as an opencode agent
+  via `~/.claude/skills/delegation/scripts/delegate-to-local-agent.sh` in the
+  worktree with `LOCAL_LLM_AGENT_EDIT = "1"`. Edits files in place. No fallback.
 
 The starter `gemini` profile sets its ceiling to `write-shell` because headless
 `agy` (`-p`) requires the "command" permission to inspect the directory. Under
@@ -152,6 +164,8 @@ task worktree.
 
 The starter keeps `default_profile = "local"`. To try `claude` first, set
 `default_profile = "claude"`; the chain then covers it when it cannot run.
+Because a chat-only `local` profile cannot edit files, editing profiles like
+`claude` and `gemini` fall back to `local-agent` instead of `local`.
 
 ## Routing and fallback
 
@@ -212,13 +226,14 @@ warning. The remaining metered profiles in that task's plan are then skipped.
 | `model` | string | required for `openai` | Model name sent to the server. |
 | `base_url` | string | required for `openai` | Base URL, e.g. `http://127.0.0.1:8080/v1`. |
 | `api_key_env` | string | none | Name of the environment variable holding the API key. |
-| `command` | array of strings | required for `command` | argv, run in the worktree. |
+| `command` | array of strings | required for `command` | argv, run in the worktree. Expands leading `~/` in `command[0]` and substitutes `{workdir}`. |
+| `env` | table: string to string | `{}` | Environment variables set on the spawned command process. |
 | `prompt_flag` | string | none | Flag preceding the prompt argument for `command` (e.g. `"-p"`). |
 | `prompt_stdin` | bool | `false` | Send the prompt on stdin instead of as the last argument. |
 | `role_prompt` | string | none | System prompt, sent ahead of the task text. |
 | `fallback` | array of profile names | `[]` | Profiles to try, in order, after this one fails routably. |
 | `permissions` | `read`, `write-workdir` or `write-shell` | `read` | Ceiling. A run never gets more than this. |
-| `permission_args` | table: level to array of strings | `{}` | Extra argv per effective permission level, before the prompt. |
+| `permission_args` | table: level to array of strings | `{}` | Extra argv per effective permission level, before the prompt; substitutes `{workdir}`. |
 | `metered` | bool | `false` | Spends paid credits. Skipped in credits-low mode. |
 | `timeout_secs` | integer | `1500` | Seconds before an attempt is killed. |
 
