@@ -145,3 +145,52 @@ fn task_ready_moves_backlog_and_blocked_to_ready() {
     let err = stderr_of_failure(&state, &["task", "ready", "1"]);
     assert!(err.contains("cannot be marked ready"), "{err}");
 }
+
+#[test]
+fn config_starter_prints_template_to_stdout_without_state_dir() {
+    let mut cmd = Command::cargo_bin("overseer").unwrap();
+    let output = cmd
+        .args(["config", "starter"])
+        .env_remove("OVERSEER_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(output).unwrap();
+    assert!(out.contains("default_profile = \"local\""), "{out}");
+    assert!(out.contains("[[profiles]]"), "{out}");
+    assert!(out.contains("name = \"local\""), "{out}");
+    assert!(out.contains("name = \"claude\""), "{out}");
+    assert!(out.contains("name = \"gemini\""), "{out}");
+}
+
+#[test]
+fn config_starter_uses_explicit_repo() {
+    let mut cmd = Command::cargo_bin("overseer").unwrap();
+    let output = cmd
+        .args(["config", "starter", "--repo", "/custom/test/repo"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(output).unwrap();
+    assert!(out.contains("repo = \"/custom/test/repo\""), "{out}");
+}
+
+#[test]
+fn config_path_prints_config_file_path() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+
+    let out = stdout_of(&state, &["config", "path"]);
+    assert_eq!(
+        out.trim(),
+        state.join("overseer.toml").display().to_string()
+    );
+}

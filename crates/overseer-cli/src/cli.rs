@@ -75,9 +75,25 @@ pub enum Command {
         #[arg(long)]
         deep: bool,
     },
+    /// Inspect or display configuration.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Show or change the routing mode.
     #[command(subcommand)]
     Mode(ModeCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the starter overseer.toml to stdout.
+    Starter {
+        /// Repository path for the starter configuration. Defaults to the
+        /// current directory.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
+    /// Print the path to the configuration file.
+    Path,
 }
 
 #[derive(Debug, Subcommand)]

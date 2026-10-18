@@ -8,7 +8,7 @@ use overseer_orchestrator::{
     doctor_report,
 };
 
-use crate::cli::{Command, ModeCommand, Switch, TaskCommand};
+use crate::cli::{Command, ConfigCommand, ModeCommand, Switch, TaskCommand};
 use crate::state;
 
 /// Exit code for a run that ended with its task blocked, so scripts can tell it
@@ -50,8 +50,24 @@ impl From<anyhow::Error> for CliError {
 const EXIT_LOCKED: u8 = 3;
 
 pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<ExitCode, CliError> {
+    if let Command::Config(ConfigCommand::Starter { repo }) = command {
+        let repo = match repo {
+            Some(path) => std::path::absolute(&path)
+                .with_context(|| format!("cannot resolve repository path {}", path.display()))?,
+            None => std::env::current_dir().context("cannot read the current directory")?,
+        };
+        print!("{}", Config::starter_toml(&repo));
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let dir = state::resolve_state_dir(state_dir)?;
     match command {
+        Command::Config(ConfigCommand::Path) => {
+            let path = state::config_path(&dir);
+            println!("{}", path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Config(ConfigCommand::Starter { .. }) => Ok(ExitCode::SUCCESS),
         Command::Init { repo } => {
             state::create_store(&dir)?;
             println!("initialised overseer state at {}", dir.display());
