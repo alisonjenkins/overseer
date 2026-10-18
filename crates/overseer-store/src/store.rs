@@ -530,6 +530,7 @@ impl Store {
         Ok(reviews)
     }
 
+    /// Set the approved status of a task.
     pub fn set_approved(&mut self, id: TaskId, approved: bool) -> Result<(), StoreError> {
         let changed = self
             .conn
