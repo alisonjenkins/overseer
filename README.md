@@ -397,7 +397,7 @@ outside the worktree, symlinks targeting outside the worktree, and any access
 touching `.git` are rejected with `error:` messages returned to the model.
 The loop executes each tool call, feeds the result back as a `tool` role message,
 sums token usage across steps, and finishes when the model produces a final answer
-without tool calls. If the loop exceeds `max_steps` (default 40), the run fails.
+without tool calls. If the loop exceeds `max_steps` (default 100), the run fails.
 
 ### Command profiles (harness CLIs)
 
@@ -426,7 +426,7 @@ installed version before relying on them; the test suite does not run them.
 - `local`: the default profile, an `openai` server on `127.0.0.1:8080`. A
   chat-only profile that returns text and cannot edit files.
 - `local-edit`: an `openai` profile on `127.0.0.1:8080` with `agent_tools = true`,
-  `max_steps = 40`, and `permissions = "write-workdir"`. Requires a llama-server
+  `max_steps = 100`, and `permissions = "write-workdir"`. Requires a llama-server
   started with tool calling (`--jinja`) and a tool-capable chat template.
 - `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with
   `permissions = "write-shell"` (`--dangerously-skip-permissions`). Falls back
@@ -696,7 +696,7 @@ was proposed, the application is safely refused with an explanatory message.
 | `metered` | bool | `false` | Spends paid credits. Skipped in credits-low mode. |
 | `timeout_secs` | integer | `1500` | Seconds before an attempt is killed. |
 | `agent_tools` | bool | `false` | Run an agent tool loop instead of a single request (`openai` backend only). |
-| `max_steps` | integer | `40` | Maximum number of tool iterations before the run fails. |
+| `max_steps` | integer | `100` | Maximum number of tool iterations before the run fails. |
 
 Configs are validated on load: unknown keys, duplicate names, invalid skill
 names, unknown `default_profile` or `fallback` names, and fallback cycles are all
