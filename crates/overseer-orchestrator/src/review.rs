@@ -59,8 +59,12 @@ pub enum ReviewError {
         source: RouterError,
     },
 
-    #[error("task {task_id} reviewer {profile:?} failed: all attempts in plan failed")]
-    ReviewerFailed { task_id: TaskId, profile: String },
+    #[error("task {task_id} reviewer {profile:?} failed: {error}")]
+    ReviewerFailed {
+        task_id: TaskId,
+        profile: String,
+        error: String,
+    },
 
     #[error("failed to get diff for branch {branch:?}")]
     Diff {
@@ -409,7 +413,7 @@ async fn run_single_reviewer(
                     task,
                     backends,
                 )
-                .await
+                .await?
             }
         }
         Err(_) => {
@@ -425,7 +429,7 @@ async fn run_single_reviewer(
                 task,
                 backends,
             )
-            .await
+            .await?
         }
     };
 
@@ -477,7 +481,7 @@ async fn retry_reviewer(
     branch: &str,
     task: &Task,
     backends: &HashMap<&str, &dyn Backend>,
-) -> (Verdict, String, String) {
+) -> Result<(Verdict, String, String), ReviewError> {
     let attempt2 = run_reviewer_attempt(
         store_mutex,
         config,
@@ -490,28 +494,18 @@ async fn retry_reviewer(
         task,
         backends,
     )
-    .await;
+    .await?;
 
-    match attempt2 {
-        Ok(out) => {
-            if let Ok(parsed) = parse_review(&out) {
-                (parsed.verdict, parsed.feedback, out)
-            } else {
-                (
-                    Verdict::Escalate,
-                    "Unparseable review verdict after retry; counted as ESCALATE.".to_owned(),
-                    format!(
-                        "{out}\n\n[Note: Unparseable review verdict after retry; counted as ESCALATE]"
-                    ),
-                )
-            }
-        }
-        Err(_) => (
+    if let Ok(parsed) = parse_review(&attempt2) {
+        Ok((parsed.verdict, parsed.feedback, attempt2))
+    } else {
+        Ok((
             Verdict::Escalate,
-            "Reviewer failed to run after retry; counted as ESCALATE.".to_owned(),
-            "VERDICT: ESCALATE\n\n[Note: Reviewer failed to run after retry; counted as ESCALATE]"
-                .to_owned(),
-        ),
+            "Unparseable review verdict after retry; counted as ESCALATE.".to_owned(),
+            format!(
+                "{attempt2}\n\n[Note: Unparseable review verdict after retry; counted as ESCALATE]"
+            ),
+        ))
     }
 }
 
@@ -538,6 +532,7 @@ async fn run_reviewer_attempt(
         .map_err(|source| ReviewError::Route { task_id, source })?;
 
     let mut credits_exhausted = false;
+    let mut last_failure = None;
     for profile in plan {
         if credits_exhausted && profile.metered {
             tracing::info!(
@@ -639,15 +634,24 @@ async fn run_reviewer_attempt(
             return Ok(attempt.output);
         }
 
+        last_failure = failure.clone();
+
         match failure {
             Some(kind) if !kind.is_routable() => break,
             _ => {}
         }
     }
 
+    let error = match last_failure {
+        Some(FailureKind::Other(detail)) => detail,
+        Some(kind) => kind.to_string(),
+        None => "all attempts in plan failed".to_owned(),
+    };
+
     Err(ReviewError::ReviewerFailed {
         task_id,
         profile: start_profile.name.clone(),
+        error,
     })
 }
 
@@ -740,7 +744,34 @@ pub async fn run_review_loop_with_backends(
     loop {
         let task = store.get_task(task_id).map_err(store_step("load task"))?;
         let results =
-            review_task_with_backends(store, config, state_dir, task_id, backends).await?;
+            match review_task_with_backends(store, config, state_dir, task_id, backends).await {
+                Ok(results) => results,
+                Err(ReviewError::ReviewerFailed { profile, error, .. }) => {
+                    let err_line = error.lines().next().unwrap_or("").trim();
+                    let reason = format!("review backend unavailable: {profile}: {err_line}");
+                    store
+                        .set_status_with_reason(task_id, TaskStatus::Blocked, Some(&reason))
+                        .map_err(store_step("set blocked"))?;
+                    return Ok(TaskStatus::Blocked);
+                }
+                Err(ReviewError::MissingBackend { profile }) => {
+                    let reason = format!("review backend unavailable: {profile}: missing backend");
+                    store
+                        .set_status_with_reason(task_id, TaskStatus::Blocked, Some(&reason))
+                        .map_err(store_step("set blocked"))?;
+                    return Ok(TaskStatus::Blocked);
+                }
+                Err(ReviewError::BuildBackend { profile, source }) => {
+                    let err_line = source.to_string();
+                    let err_line = err_line.lines().next().unwrap_or("").trim();
+                    let reason = format!("review backend unavailable: {profile}: {err_line}");
+                    store
+                        .set_status_with_reason(task_id, TaskStatus::Blocked, Some(&reason))
+                        .map_err(store_step("set blocked"))?;
+                    return Ok(TaskStatus::Blocked);
+                }
+                Err(err) => return Err(err),
+            };
         let verdicts: Vec<Verdict> = results.iter().map(|r| r.verdict).collect();
         let overall = overall_verdict(&verdicts);
         let reviewer_details = results
@@ -944,6 +975,18 @@ mod tests {
                 output,
                 usage: Usage::default(),
                 failure: None,
+            })
+        }
+    }
+
+    /// Backend that always fails with a scripted error.
+    struct FailingReviewBackend(&'static str);
+
+    #[async_trait]
+    impl Backend for FailingReviewBackend {
+        async fn run(&self, _req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            Err(BackendError::Scripted {
+                message: self.0.to_owned(),
             })
         }
     }
@@ -1574,6 +1617,60 @@ mod tests {
         assert!(
             reason.contains("Needs human approval for migration"),
             "expected reason to contain bullet text, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_reviewer_blocks_task() {
+        let mut fix = fixture();
+        let task_id = add_task(&mut fix.store, "Unreachable reviewer");
+
+        let worker = WorkerBackend::new("fix.txt");
+        let rev1 = FailingReviewBackend("openai endpoint unreachable");
+
+        let mut backends: HashMap<&str, &dyn Backend> = HashMap::new();
+        backends.insert("local", &worker);
+        backends.insert("rev1", &rev1);
+
+        let config = Config {
+            repo: fix.repo.clone(),
+            default_profile: "local".to_owned(),
+            review: overseer_core::ReviewConfig {
+                profiles: vec!["rev1".to_owned()],
+                max_reworks: 2,
+                rework_profile: None,
+            },
+            profiles: vec![test_profile("local"), test_profile("rev1")],
+            learning: Default::default(),
+            escalation: Default::default(),
+            landing: Default::default(),
+            sources: Default::default(),
+        };
+
+        run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+            .await
+            .unwrap();
+
+        let status =
+            run_review_loop_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+                .await
+                .unwrap();
+
+        assert_eq!(status, TaskStatus::Blocked);
+        let task = fix.store.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        let reason = task.reason.as_deref().expect("expected blocked reason");
+        assert!(
+            reason.starts_with("review backend unavailable:"),
+            "expected prefix 'review backend unavailable:', got {reason:?}"
+        );
+        assert!(
+            reason.contains("rev1"),
+            "expected profile 'rev1' in reason, got {reason:?}"
+        );
+        assert!(
+            reason.contains("openai endpoint unreachable"),
+            "expected error in reason, got {reason:?}"
         );
     }
 
