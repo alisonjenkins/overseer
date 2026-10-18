@@ -224,3 +224,7 @@ warning. The remaining metered profiles in that task's plan are then skipped.
 
 Configs are validated on load: unknown keys, duplicate names, unknown
 `default_profile` or `fallback` names, and fallback cycles are all rejected.
+
+## Licence
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
