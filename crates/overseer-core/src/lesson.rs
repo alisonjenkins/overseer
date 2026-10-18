@@ -47,6 +47,22 @@ impl LessonStatus {
     }
 }
 
+impl fmt::Display for LessonStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LessonStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_db_text(s).ok_or_else(|| {
+            format!("unknown lesson status {s:?}; expected one of proposed, applied, rejected")
+        })
+    }
+}
+
 /// Inputs to create a new proposed lesson row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLesson {

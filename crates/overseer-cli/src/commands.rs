@@ -2,13 +2,17 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use overseer_core::{BackendKind, Config, NewTask, Run, Task, TaskId, TaskStatus};
+use overseer_core::{
+    BackendKind, Config, Lesson, LessonId, LessonStatus, NewTask, Run, Task, TaskId, TaskStatus,
+};
 use overseer_orchestrator::{
     RunSummary, ShutdownSignal, WorkerError, WorkerLockError, WorkerOptions, check_worker_status,
     doctor_report,
 };
 
-use crate::cli::{Command, ConfigCommand, ModeCommand, SkillsCommand, Switch, TaskCommand};
+use crate::cli::{
+    Command, ConfigCommand, LessonsCommand, ModeCommand, SkillsCommand, Switch, TaskCommand,
+};
 use crate::state;
 
 /// Exit code for a run that ended with its task blocked, so scripts can tell it
@@ -43,6 +47,12 @@ impl std::error::Error for CliError {
 impl From<anyhow::Error> for CliError {
     fn from(err: anyhow::Error) -> Self {
         Self::Other(err)
+    }
+}
+
+impl From<overseer_store::StoreError> for CliError {
+    fn from(err: overseer_store::StoreError) -> Self {
+        Self::Other(err.into())
     }
 }
 
@@ -116,6 +126,8 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
             run_skills(&dir, skills)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Lessons(lessons) => run_lessons(&dir, lessons),
+        Command::Retro { task_id } => run_retro(&dir, task_id),
     }
 }
 
@@ -384,6 +396,128 @@ fn print_skills(skills: &[overseer_store::skills::SkillSummary]) {
             w = name_width
         );
     }
+}
+
+fn run_lessons(dir: &Path, command: LessonsCommand) -> Result<ExitCode, CliError> {
+    let mut store = state::open_existing_store(dir)?;
+    match command {
+        LessonsCommand::List { status } => {
+            let lessons = store.list_lessons(status)?;
+            print_lessons(&lessons);
+        }
+        LessonsCommand::Show { id } => {
+            let lesson_id = LessonId::new(id);
+            let _ = store.get_lesson(lesson_id)?;
+            let diff_path = dir.join("lessons").join(format!("{id}.diff"));
+            let diff = std::fs::read_to_string(&diff_path)
+                .with_context(|| format!("diff file {} not found", diff_path.display()))?;
+            print!("{diff}");
+            if !diff.ends_with('\n') {
+                println!();
+            }
+        }
+        LessonsCommand::Apply { id } => {
+            let lesson_id = LessonId::new(id);
+            let lesson = store.get_lesson(lesson_id)?;
+            if lesson.status != LessonStatus::Proposed {
+                return Err(CliError::Refusal(format!(
+                    "lesson {id} has status {}; only proposed lessons can be applied",
+                    lesson.status.as_str()
+                )));
+            }
+            let skills_dir = dir.join("skills");
+            let current =
+                overseer_store::skills::current_version(&skills_dir, &lesson.skill)?.unwrap_or(0);
+            if current != lesson.base_version {
+                return Err(CliError::Refusal(format!(
+                    "skill '{}' current version is v{current}, but lesson {id} was based on v{}; refusing to apply",
+                    lesson.skill, lesson.base_version
+                )));
+            }
+            let proposed_path = if lesson.path.as_os_str().is_empty() {
+                dir.join("lessons").join(format!("{id}.md"))
+            } else {
+                lesson.path.clone()
+            };
+            let proposed_text = std::fs::read_to_string(&proposed_path).with_context(|| {
+                format!(
+                    "failed to read proposed lesson from {}",
+                    proposed_path.display()
+                )
+            })?;
+            let new_version = overseer_store::skills::create_next_version(
+                &skills_dir,
+                &lesson.skill,
+                &proposed_text,
+            )?;
+            store.set_lesson_status(lesson_id, LessonStatus::Applied)?;
+            println!(
+                "applied lesson {id}: skill '{}' updated to v{new_version}",
+                lesson.skill
+            );
+        }
+        LessonsCommand::Reject { id } => {
+            let lesson_id = LessonId::new(id);
+            let lesson = store.get_lesson(lesson_id)?;
+            if lesson.status != LessonStatus::Proposed {
+                return Err(CliError::Refusal(format!(
+                    "lesson {id} has status {}; only proposed lessons can be rejected",
+                    lesson.status.as_str()
+                )));
+            }
+            store.set_lesson_status(lesson_id, LessonStatus::Rejected)?;
+            println!("lesson {id} rejected");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_lessons(lessons: &[Lesson]) {
+    println!(
+        "{:>5}  {:>5}  {:<16}  {:>4}  {:<10}  CREATED",
+        "ID", "TASK", "SKILL", "BASE", "STATUS"
+    );
+    for l in lessons {
+        println!(
+            "{:>5}  {:>5}  {:<16}  {:>4}  {:<10}  {}",
+            l.id,
+            l.task_id,
+            l.skill,
+            format!("v{}", l.base_version),
+            l.status.as_str(),
+            l.created_at
+        );
+    }
+}
+
+fn run_retro(dir: &Path, task_id: i64) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    if config.learning.profile.is_none() {
+        return Err(CliError::Refusal(
+            "no learning profile configured in overseer.toml".to_owned(),
+        ));
+    }
+    let mut store = state::open_existing_store(dir)?;
+    let id = TaskId::new(task_id);
+    let _ = store.get_task(id)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let outcome = runtime
+        .block_on(overseer_orchestrator::retrospect_task(
+            &mut store, &config, dir, id,
+        ))
+        .map_err(anyhow::Error::from)?;
+    match outcome {
+        Some(lesson) => {
+            println!("lesson {} proposed for skill {}", lesson.id, lesson.skill);
+        }
+        None => {
+            println!("no lesson proposed (learning profile replied NO CHANGE)");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn list_runs(dir: &Path, task_id: i64) -> Result<()> {

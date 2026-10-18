@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use overseer_core::TaskStatus;
+use overseer_core::{LessonStatus, TaskStatus};
 
 /// Single-user agentic task orchestrator.
 #[derive(Debug, Parser)]
@@ -89,6 +89,14 @@ pub enum Command {
     /// Manage skills.
     #[command(subcommand)]
     Skills(SkillsCommand),
+    /// Manage lessons.
+    #[command(subcommand)]
+    Lessons(LessonsCommand),
+    /// Run a retrospective manually on a task.
+    Retro {
+        /// Id of the task to retrospect.
+        task_id: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +155,31 @@ pub enum SkillsCommand {
         name: String,
         /// Version number to make active.
         version: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LessonsCommand {
+    /// List lessons, optionally filtered by status.
+    List {
+        /// Filter by lesson status: proposed, applied, rejected.
+        #[arg(long)]
+        status: Option<LessonStatus>,
+    },
+    /// Show a proposed lesson's diff.
+    Show {
+        /// Id of the lesson to show.
+        id: i64,
+    },
+    /// Apply a proposed lesson to the target skill.
+    Apply {
+        /// Id of the lesson to apply.
+        id: i64,
+    },
+    /// Reject a proposed lesson.
+    Reject {
+        /// Id of the lesson to reject.
+        id: i64,
     },
 }
 

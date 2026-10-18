@@ -116,7 +116,10 @@ pub fn check_worker_status(state_dir: &Path) -> Result<Option<u32>, std::io::Err
         Err(err) => return Err(err),
     };
     match file.try_lock() {
-        Ok(()) => Ok(None),
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(None)
+        }
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut content = String::new();
             let _ = std::fs::read_to_string(&path).map(|c| content = c);
