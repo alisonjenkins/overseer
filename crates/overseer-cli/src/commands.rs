@@ -97,6 +97,7 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         Command::Diff { id, stat } => run_diff(&dir, id, stat),
         Command::Merge { id } => run_merge(&dir, id),
         Command::Discard { id } => run_discard(&dir, id),
+        Command::Review { id } => run_review(&dir, id),
         Command::Worker {
             once,
             max_tasks,
@@ -148,6 +149,12 @@ fn run_merge(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
             "task {id} has status {}; only tasks in review can be merged",
             task.status
         )));
+    }
+    let reviews = store
+        .list_reviews(task_id)
+        .with_context(|| format!("failed to list reviews for task {id}"))?;
+    if !reviews.is_empty() && !task.approved {
+        eprintln!("warning: task {id} has reviews and is not approved");
     }
     let branch = overseer_orchestrator::branch_name(task_id);
     let wt_path = overseer_orchestrator::worktree_path(dir, task_id);
@@ -236,16 +243,61 @@ fn run_one(dir: &Path, id: i64) -> Result<ExitCode> {
         .enable_all()
         .build()
         .context("failed to start the async runtime")?;
+    let task_id = TaskId::new(id);
     let summary = runtime
         .block_on(overseer_orchestrator::run_task(
-            &mut store,
-            &config,
-            dir,
-            TaskId::new(id),
+            &mut store, &config, dir, task_id,
         ))
         .with_context(|| format!("failed to run task {id}"))?;
     print_run_summary(&summary);
-    Ok(if summary.status == TaskStatus::Blocked {
+
+    let final_status = if summary.status == TaskStatus::Review && !config.review.profiles.is_empty()
+    {
+        runtime
+            .block_on(overseer_orchestrator::run_review_loop(
+                &mut store, &config, dir, task_id,
+            ))
+            .with_context(|| format!("failed to review task {id}"))?
+    } else {
+        summary.status
+    };
+
+    Ok(if final_status == TaskStatus::Blocked {
+        ExitCode::from(EXIT_BLOCKED)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn run_review(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let task = store
+        .get_task(task_id)
+        .with_context(|| format!("failed to find task {id}"))?;
+    if task.status != TaskStatus::Review {
+        return Err(CliError::Refusal(format!(
+            "task {id} has status {}; only tasks in review can be reviewed",
+            task.status
+        )));
+    }
+    if config.review.profiles.is_empty() {
+        return Err(CliError::Refusal(
+            "review is disabled: no reviewer profiles configured in overseer.toml".to_owned(),
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let final_status = runtime
+        .block_on(overseer_orchestrator::run_review_loop(
+            &mut store, &config, dir, task_id,
+        ))
+        .with_context(|| format!("failed to review task {id}"))?;
+
+    Ok(if final_status == TaskStatus::Blocked {
         ExitCode::from(EXIT_BLOCKED)
     } else {
         ExitCode::SUCCESS
@@ -372,10 +424,14 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
             print_list(&tasks);
         }
         TaskCommand::Show { id } => {
+            let task_id = TaskId::new(id);
             let task = store
-                .get_task(TaskId::new(id))
+                .get_task(task_id)
                 .with_context(|| format!("failed to show task {id}"))?;
-            print_task(&task);
+            let reviews = store
+                .list_reviews(task_id)
+                .with_context(|| format!("failed to list reviews for task {id}"))?;
+            print_task(&task, &reviews);
         }
     }
     Ok(())
@@ -394,7 +450,7 @@ fn print_list(tasks: &[Task]) {
     }
 }
 
-fn print_task(task: &Task) {
+fn print_task(task: &Task, reviews: &[overseer_core::ReviewRecord]) {
     let depends_on = if task.depends_on.is_empty() {
         "-".to_owned()
     } else {
@@ -410,8 +466,27 @@ fn print_task(task: &Task) {
     println!("priority: {}", task.priority);
     println!("profile: {}", task.profile.as_deref().unwrap_or("-"));
     println!("round: {}", task.round);
+    println!("approved: {}", task.approved);
     println!("depends_on: {depends_on}");
     println!("created_at: {}", task.created_at);
+    if !reviews.is_empty() {
+        println!();
+        println!("reviews:");
+        println!(
+            "{:>5}  {:>5}  {:<12}  {:<8}  PATH",
+            "ID", "ROUND", "PROFILE", "VERDICT"
+        );
+        for r in reviews {
+            println!(
+                "{:>5}  {:>5}  {:<12}  {:<8}  {}",
+                r.id,
+                r.round,
+                r.profile,
+                r.verdict.as_str(),
+                r.path.display()
+            );
+        }
+    }
     if !task.body.is_empty() {
         println!();
         println!("{}", task.body);

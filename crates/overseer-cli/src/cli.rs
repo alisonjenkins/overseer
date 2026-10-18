@@ -55,6 +55,11 @@ pub enum Command {
         /// Id of the task to discard.
         id: i64,
     },
+    /// Run the review loop manually on a task in review.
+    Review {
+        /// Id of the task to review.
+        id: i64,
+    },
     /// Drain the ready task queue.
     Worker {
         /// Exit immediately if no ready tasks are eligible.
