@@ -275,6 +275,7 @@ impl Store {
         Ok(())
     }
 
+    /// Set the status of a task to the given status.
     pub fn set_status(&mut self, id: TaskId, status: TaskStatus) -> Result<(), StoreError> {
         self.set_status_with_reason(id, status, None)
     }
