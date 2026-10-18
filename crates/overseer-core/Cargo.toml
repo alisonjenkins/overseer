@@ -1,0 +1,9 @@
+[package]
+name = "overseer-core"
+description = "Domain types for the overseer task orchestrator"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
