@@ -1,0 +1,21 @@
+[package]
+name = "overseer-orchestrator"
+description = "Task execution: worktrees, runs and task status transitions"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+overseer-backends = { version = "0.1.0", path = "../overseer-backends" }
+overseer-core = { version = "0.1.0", path = "../overseer-core" }
+overseer-store = { version = "0.1.0", path = "../overseer-store" }
+thiserror = "2"
+tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+async-trait = "0.1.92"
+tempfile = "3.27.0"

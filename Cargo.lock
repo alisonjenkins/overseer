@@ -1048,6 +1048,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "overseer-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "overseer-backends",
+ "overseer-core",
+ "overseer-store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "overseer-store"
 version = "0.1.0"
 dependencies = [

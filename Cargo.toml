@@ -4,6 +4,7 @@ members = [
     "crates/overseer-core",
     "crates/overseer-store",
     "crates/overseer-backends",
+    "crates/overseer-orchestrator",
     "crates/overseer-cli",
 ]
 
