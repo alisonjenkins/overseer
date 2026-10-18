@@ -21,6 +21,7 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          inherit (pkgs) lib;
           overseer = pkgs.rustPlatform.buildRustPackage {
             pname = "overseer";
             inherit version;
@@ -44,6 +45,7 @@
             meta = {
               description = "Overseer: single-user agentic task orchestrator";
               mainProgram = "overseer";
+              license = with lib.licenses; [ mit asl20 ];
             };
           };
         in
