@@ -10,8 +10,8 @@ mod status;
 mod task;
 
 pub use config::{
-    BackendKind, Config, EscalationConfig, LearningConfig, Profile, ReviewConfig, SourceConfig,
-    is_valid_skill_name,
+    BackendKind, Config, EscalationConfig, GpuConfig, LearningConfig, Profile, ReviewConfig,
+    SourceConfig, is_valid_skill_name,
 };
 pub use lesson::{Lesson, LessonId, LessonStatus, NewLesson};
 pub use permissions::Permissions;

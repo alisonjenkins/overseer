@@ -274,6 +274,7 @@ mod tests {
             agent_tools: false,
             max_steps: 40,
             skills: Vec::new(),
+            gpu: false,
         }
     }
 

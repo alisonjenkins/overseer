@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod escalation;
+pub mod gpu;
 pub mod landing;
 pub mod learning;
 mod lock;
@@ -21,6 +22,10 @@ mod test_support;
 
 pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
 pub use escalation::escalation_hits;
+pub use gpu::{
+    DEFAULT_POLL_INTERVAL, GpuError, check_inhibit, check_inhibit_command, clear_inhibit, gate,
+    is_inhibited, read_inhibit_flag, set_inhibit,
+};
 pub use landing::{LandOutcome, LandingError, land};
 pub use learning::{
     RetrospectError, has_learning_signal, retrospect_task, retrospect_task_with_backend,

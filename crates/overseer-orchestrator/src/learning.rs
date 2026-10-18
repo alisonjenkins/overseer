@@ -411,6 +411,7 @@ mod tests {
                 agent_tools: false,
                 max_steps: 40,
                 skills: Vec::new(),
+                gpu: false,
             }],
             learning: LearningConfig {
                 profile: Some("agent".to_owned()),
@@ -421,6 +422,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         }
     }
 

@@ -47,6 +47,7 @@ mod tests {
             profiles: Vec::new(),
             learning: Default::default(),
             sources,
+            gpu: Default::default(),
         }
     }
 

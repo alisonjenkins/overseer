@@ -564,6 +564,20 @@ async fn run_reviewer_attempt(
             permissions: Permissions::Read,
         };
 
+        if profile.gpu {
+            crate::gpu::gate(
+                state_dir,
+                config.gpu.inhibit_command.as_deref(),
+                crate::gpu::DEFAULT_POLL_INTERVAL,
+            )
+            .await
+            .map_err(|err| ReviewError::ReviewerFailed {
+                task_id,
+                profile: start_profile.name.clone(),
+                error: err.to_string(),
+            })?;
+        }
+
         let outcome = backend.run(&request).await;
         let mut attempt = match outcome {
             Ok(res) => Attempt {
@@ -918,6 +932,7 @@ mod tests {
             agent_tools: false,
             max_steps: 40,
             skills: Vec::new(),
+            gpu: false,
         }
     }
 
@@ -1213,6 +1228,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         // First run the task to create branch & commit
@@ -1291,6 +1307,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1336,6 +1353,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1377,6 +1395,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1423,6 +1442,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1473,6 +1493,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1550,6 +1571,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1595,6 +1617,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
@@ -1645,6 +1668,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
         };
 
         run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)

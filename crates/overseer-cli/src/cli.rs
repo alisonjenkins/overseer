@@ -109,6 +109,23 @@ pub enum Command {
         /// Id of the task to retrospect.
         task_id: i64,
     },
+    /// Manage GPU inhibition.
+    #[command(subcommand)]
+    Gpu(GpuCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GpuCommand {
+    /// Inhibit GPU tasks by creating the inhibit flag file.
+    Inhibit {
+        /// Reason for inhibition.
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
+    /// Release GPU inhibition by removing the inhibit flag file.
+    Release,
+    /// Report GPU inhibition status.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]

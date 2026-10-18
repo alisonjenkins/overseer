@@ -407,15 +407,26 @@ async fn execute(
                 };
                 match ready {
                     Ok(()) => {
-                        run_in_worktree(
-                            backend,
-                            profile,
-                            &task,
-                            worktree,
-                            &prompt,
-                            system_prompt.clone(),
-                        )
-                        .await
+                        if profile.gpu
+                            && let Err(err) = crate::gpu::gate(
+                                state_dir,
+                                config.gpu.inhibit_command.as_deref(),
+                                crate::gpu::DEFAULT_POLL_INTERVAL,
+                            )
+                            .await
+                        {
+                            Attempt::failed(FailureKind::Other(err.to_string()))
+                        } else {
+                            run_in_worktree(
+                                backend,
+                                profile,
+                                &task,
+                                worktree,
+                                &prompt,
+                                system_prompt.clone(),
+                            )
+                            .await
+                        }
                     }
                     Err(err) => Attempt::failed(FailureKind::Other(format!("discard: {err}"))),
                 }
@@ -772,6 +783,7 @@ mod tests {
             agent_tools: false,
             max_steps: 40,
             skills: Vec::new(),
+            gpu: false,
         }
     }
 
@@ -783,6 +795,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
             profiles: vec![profile("local"), profile("alt")],
             learning: Default::default(),
         }
@@ -1094,6 +1107,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
             profiles,
             learning: Default::default(),
         }

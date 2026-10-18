@@ -83,6 +83,7 @@ mod tests {
             agent_tools: false,
             max_steps: 40,
             skills: Vec::new(),
+            gpu: false,
         }
     }
 
@@ -94,6 +95,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
             profiles,
             learning: Default::default(),
         }

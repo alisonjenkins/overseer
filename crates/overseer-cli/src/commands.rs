@@ -11,7 +11,8 @@ use overseer_orchestrator::{
 };
 
 use crate::cli::{
-    Command, ConfigCommand, LessonsCommand, ModeCommand, SkillsCommand, Switch, TaskCommand,
+    Command, ConfigCommand, GpuCommand, LessonsCommand, ModeCommand, SkillsCommand, Switch,
+    TaskCommand,
 };
 use crate::state;
 
@@ -143,7 +144,40 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         }
         Command::Lessons(lessons) => run_lessons(&dir, lessons),
         Command::Retro { task_id } => run_retro(&dir, task_id),
+        Command::Gpu(gpu) => {
+            run_gpu(&dir, gpu)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+fn run_gpu(dir: &Path, command: GpuCommand) -> Result<()> {
+    match command {
+        GpuCommand::Inhibit { reason } => {
+            overseer_orchestrator::gpu::set_inhibit(dir, &reason)
+                .context("failed to write GPU inhibit flag")?;
+        }
+        GpuCommand::Release => {
+            overseer_orchestrator::gpu::clear_inhibit(dir)
+                .context("failed to remove GPU inhibit flag")?;
+        }
+        GpuCommand::Status => {
+            match overseer_orchestrator::gpu::read_inhibit_flag(dir) {
+                Some((ts, reason)) => println!("inhibited: {reason} since {ts}"),
+                None => println!("clear"),
+            }
+            if let Ok(config) = state::load_config(dir)
+                && let Some(cmd) = config.gpu.inhibit_command
+            {
+                if overseer_orchestrator::gpu::check_inhibit_command(&cmd) {
+                    println!("command: busy");
+                } else {
+                    println!("command: clear");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_diff(dir: &Path, id: i64, stat: bool) -> Result<ExitCode, CliError> {

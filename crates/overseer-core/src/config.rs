@@ -93,6 +93,8 @@ timeout_secs = 1500
 role_prompt = "You are a careful senior engineer."
 # Profiles to try, in order, when this one cannot run. Empty: local ends the chain.
 fallback = []
+# Marks a profile that uses the GPU.
+gpu = true
 
 # A local model running with the agent tool loop so it can inspect and edit
 # files in the task worktree. It needs a llama-server started with tool calling (`--jinja`)
@@ -108,6 +110,8 @@ role_prompt = "You are a careful senior engineer."
 agent_tools = true
 max_steps = 100
 fallback = []
+# Marks a profile that uses the GPU.
+gpu = true
 
 # Gemini through the agy CLI. Needs `agy` on PATH and signed in.
 # agy must be signed in (run `agy` once interactively).
@@ -154,6 +158,8 @@ command = ["~/.claude/skills/delegation/scripts/delegate-to-local-agent.sh", "{w
 env = { LOCAL_LLM_AGENT_EDIT = "1" }
 permissions = "write-workdir"
 timeout_secs = 1800
+# Marks a profile that uses the GPU.
+gpu = true
 "#;
 
 /// Which backend implementation a profile selects.
@@ -223,6 +229,9 @@ pub struct Profile {
     /// Skill names to inject into the system prompt.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Marks a profile that uses the GPU.
+    #[serde(default)]
+    pub gpu: bool,
 }
 
 impl Profile {
@@ -417,12 +426,22 @@ pub struct SourceConfig {
     pub ready: bool,
 }
 
+/// Configuration for GPU inhibition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuConfig {
+    #[serde(default)]
+    pub inhibit_command: Option<String>,
+}
+
 /// The whole `overseer.toml` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub repo: PathBuf,
     pub default_profile: String,
+    #[serde(default)]
+    pub gpu: GpuConfig,
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
@@ -1015,6 +1034,29 @@ command = []
         assert_eq!(local_agent.timeout_secs, 1800);
         assert_eq!(local_agent.role_prompt, None);
         assert!(local_agent.fallback.is_empty());
+
+        assert!(local.gpu);
+        assert!(local_edit.gpu);
+        assert!(local_agent.gpu);
+        assert!(!gemini.gpu);
+        assert!(!claude.gpu);
+    }
+
+    #[test]
+    fn gpu_defaults_to_false() {
+        let config = Config::from_toml_str(MINIMAL).unwrap();
+        assert!(!config.profile("local").unwrap().gpu);
+        assert_eq!(config.gpu.inhibit_command, None);
+    }
+
+    #[test]
+    fn gpu_table_and_profile_flag_parse() {
+        let text = format!("{MINIMAL}\n[gpu]\ninhibit_command = \"pgrep -x steam\"\n");
+        let config = Config::from_toml_str(&text).unwrap();
+        assert_eq!(
+            config.gpu.inhibit_command.as_deref(),
+            Some("pgrep -x steam")
+        );
     }
 
     #[test]

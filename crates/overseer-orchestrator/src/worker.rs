@@ -61,6 +61,7 @@ pub struct ShutdownSignal {
 
 impl ShutdownSignal {
     pub fn new(receiver: watch::Receiver<bool>) -> Self {
+        crate::gpu::register_shutdown(receiver.clone());
         Self { receiver }
     }
 
@@ -338,6 +339,7 @@ mod tests {
             agent_tools: false,
             max_steps: 40,
             skills: Vec::new(),
+            gpu: false,
         }
     }
 
@@ -349,6 +351,7 @@ mod tests {
             escalation: Default::default(),
             landing: Default::default(),
             sources: Default::default(),
+            gpu: Default::default(),
             profiles: vec![
                 fake_command_profile("succeed", "echo ok > file.txt && echo done"),
                 fake_command_profile("fail", "exit 1"),
