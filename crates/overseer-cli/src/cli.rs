@@ -60,6 +60,11 @@ pub enum Command {
         /// Id of the task to review.
         id: i64,
     },
+    /// Approve a task that needs human intervention due to an escalation.
+    Approve {
+        /// Id of the task to approve.
+        id: i64,
+    },
     /// Drain the ready task queue.
     Worker {
         /// Exit immediately if no ready tasks are eligible.

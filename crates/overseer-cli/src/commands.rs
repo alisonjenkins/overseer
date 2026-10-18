@@ -108,6 +108,7 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         Command::Merge { id } => run_merge(&dir, id),
         Command::Discard { id } => run_discard(&dir, id),
         Command::Review { id } => run_review(&dir, id),
+        Command::Approve { id } => run_approve(&dir, id),
         Command::Worker {
             once,
             max_tasks,
@@ -318,6 +319,44 @@ fn run_review(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn run_approve(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
+    let mut store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let task = store
+        .get_task(task_id)
+        .with_context(|| format!("failed to find task {id}"))?;
+
+    if task.status != TaskStatus::NeedsHuman {
+        return Err(CliError::Refusal(format!(
+            "task {id} has status {}; only tasks in needs-human can be approved",
+            task.status
+        )));
+    }
+
+    let Some(ref reason) = task.reason else {
+        return Err(CliError::Refusal(format!(
+            "task {id} does not have an escalation reason to approve"
+        )));
+    };
+
+    if !reason.starts_with("escalation") {
+        return Err(CliError::Refusal(format!(
+            "task {id} reason {reason:?} is not an escalation reason"
+        )));
+    }
+
+    let approved_reason = format!("approved: {reason}");
+    store
+        .set_approved(task_id, true)
+        .with_context(|| format!("failed to approve task {id}"))?;
+    store
+        .set_status_with_reason(task_id, TaskStatus::Review, Some(&approved_reason))
+        .with_context(|| format!("failed to move task {id} to review"))?;
+
+    println!("task {id} approved");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_mode(dir: &Path, command: ModeCommand) -> Result<()> {
@@ -534,6 +573,9 @@ fn list_runs(dir: &Path, task_id: i64) -> Result<()> {
 fn print_run_summary(summary: &RunSummary) {
     println!("run: {}", summary.run_id);
     println!("task: {} -> {}", summary.task_id, summary.status);
+    if let Some(ref reason) = summary.reason {
+        println!("reason: {reason}");
+    }
     match &summary.failure {
         None => println!("outcome: succeeded"),
         Some(kind) => println!("outcome: failed ({kind})"),
@@ -668,6 +710,9 @@ fn print_task(task: &Task, reviews: &[overseer_core::ReviewRecord]) {
     println!("approved: {}", task.approved);
     println!("depends_on: {depends_on}");
     println!("created_at: {}", task.created_at);
+    if let Some(ref reason) = task.reason {
+        println!("reason: {reason}");
+    }
     if !reviews.is_empty() {
         println!();
         println!("reviews:");
