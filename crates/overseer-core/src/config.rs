@@ -78,6 +78,35 @@ impl Config {
         Ok(config)
     }
 
+    /// The configuration `overseer init` writes: one `local` profile pointing
+    /// at a llama.cpp-style server on 127.0.0.1:8080.
+    pub fn starter(repo: PathBuf) -> Self {
+        Self {
+            repo,
+            default_profile: "local".to_owned(),
+            profiles: vec![Profile {
+                name: "local".to_owned(),
+                backend: BackendKind::Openai,
+                model: Some("local".to_owned()),
+                base_url: Some("http://127.0.0.1:8080/v1".to_owned()),
+                api_key_env: None,
+                command: None,
+                prompt_stdin: false,
+                role_prompt: Some("You are a careful senior engineer.".to_owned()),
+                fallback: Vec::new(),
+                permissions: Permissions::WriteWorkdir,
+                timeout_secs: DEFAULT_TIMEOUT_SECS,
+            }],
+        }
+    }
+
+    /// Serialise to the `overseer.toml` format.
+    pub fn to_toml_string(&self) -> Result<String, CoreError> {
+        toml::to_string(self).map_err(|err| CoreError::ConfigSerialize {
+            message: err.to_string(),
+        })
+    }
+
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|profile| profile.name == name)
     }
@@ -351,6 +380,33 @@ command = []
     fn unknown_keys_are_rejected() {
         let text = MINIMAL.replace("model = \"local\"", "model = \"local\"\ntemprature = 0.2");
         assert!(matches!(parse_err(&text), CoreError::ConfigParse { .. }));
+    }
+
+    #[test]
+    fn starter_config_is_valid_and_points_at_local_server() {
+        let config = Config::starter(PathBuf::from("/work/project"));
+        config.validate().unwrap();
+        let profile = config.profile("local").unwrap();
+        assert_eq!(config.default_profile, "local");
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(profile.model.as_deref(), Some("local"));
+        assert_eq!(profile.permissions, Permissions::WriteWorkdir);
+        assert_eq!(profile.timeout_secs, 1500);
+        assert_eq!(
+            profile.role_prompt.as_deref(),
+            Some("You are a careful senior engineer.")
+        );
+    }
+
+    #[test]
+    fn starter_config_serialises_and_parses_back() {
+        let config = Config::starter(PathBuf::from("/work/project"));
+        let text = config.to_toml_string().unwrap();
+        assert!(text.contains("default_profile = \"local\""), "{text}");
+        assert_eq!(Config::from_toml_str(&text).unwrap(), config);
     }
 
     #[test]

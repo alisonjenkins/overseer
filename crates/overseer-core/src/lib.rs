@@ -25,6 +25,9 @@ pub enum CoreError {
     #[error("failed to parse overseer.toml: {message}")]
     ConfigParse { message: String },
 
+    #[error("failed to serialise overseer.toml: {message}")]
+    ConfigSerialize { message: String },
+
     #[error("profile {name:?} is defined more than once")]
     DuplicateProfile { name: String },
 
