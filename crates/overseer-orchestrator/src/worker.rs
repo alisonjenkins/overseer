@@ -3,13 +3,16 @@
 use std::path::Path;
 use std::time::Duration;
 
-use overseer_core::{Config, TaskStatus};
+use overseer_core::{Config, TaskSource, TaskStatus};
 use overseer_store::{Store, StoreError};
 use tokio::sync::watch;
 
 use crate::lock::{WorkerLock, WorkerLockError};
 use crate::recovery::{RecoveryError, recover_interrupted};
 use crate::runner::{RunnerError, run_task};
+use crate::sources::build_sources;
+use crate::sync::sync_sources;
+use crate::watch::SourceWatcher;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
@@ -81,6 +84,32 @@ pub struct WorkerStats {
     pub tasks_blocked: usize,
 }
 
+struct SourceWatchContext {
+    sources: Vec<Box<dyn TaskSource>>,
+    watcher: Option<SourceWatcher>,
+    rescan_interval: tokio::time::Interval,
+}
+
+fn perform_sync(store: &mut Store, sources: &[Box<dyn TaskSource>]) {
+    match sync_sources(store, sources) {
+        Ok(report) => {
+            tracing::info!(
+                added = report.added,
+                updated = report.updated,
+                cancelled = report.cancelled,
+                revived = report.revived,
+                "sources synced"
+            );
+            for warning in &report.warnings {
+                tracing::warn!(warning = %warning, "source sync warning");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%err, "sources sync failed");
+        }
+    }
+}
+
 /// Drain the ready task queue according to `options`, running each task along
 /// its fallback chain and stopping cleanly on `shutdown`.
 pub async fn run_worker(
@@ -94,6 +123,34 @@ pub async fn run_worker(
     let _recovered = recover_interrupted(store)?;
 
     let mut stats = WorkerStats::default();
+
+    let mut watch_context = if config.sources.is_empty() {
+        None
+    } else {
+        match build_sources(config) {
+            Ok(sources) => {
+                perform_sync(store, &sources);
+                let watcher = match SourceWatcher::start(&sources) {
+                    Ok(w) => Some(w),
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to start source watcher; continuing without watching");
+                        None
+                    }
+                };
+                let mut rescan_interval = tokio::time::interval(Duration::from_secs(600));
+                rescan_interval.tick().await;
+                Some(SourceWatchContext {
+                    sources,
+                    watcher,
+                    rescan_interval,
+                })
+            }
+            Err(err) => {
+                tracing::warn!(%err, "failed to build task sources; continuing without watching");
+                None
+            }
+        }
+    };
 
     loop {
         if shutdown.is_shutting_down() {
@@ -111,11 +168,38 @@ pub async fn run_worker(
                 if options.once {
                     break;
                 }
-                tokio::select! {
-                    () = shutdown.wait_for_shutdown() => {
-                        break;
+                if let Some(ctx) = &mut watch_context {
+                    if let Some(watcher) = &mut ctx.watcher {
+                        tokio::select! {
+                            () = shutdown.wait_for_shutdown() => {
+                                break;
+                            }
+                            () = tokio::time::sleep(options.poll_interval) => {}
+                            _ = watcher.next_change() => {
+                                perform_sync(store, &ctx.sources);
+                            }
+                            _ = ctx.rescan_interval.tick() => {
+                                perform_sync(store, &ctx.sources);
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            () = shutdown.wait_for_shutdown() => {
+                                break;
+                            }
+                            () = tokio::time::sleep(options.poll_interval) => {}
+                            _ = ctx.rescan_interval.tick() => {
+                                perform_sync(store, &ctx.sources);
+                            }
+                        }
                     }
-                    () = tokio::time::sleep(options.poll_interval) => {}
+                } else {
+                    tokio::select! {
+                        () = shutdown.wait_for_shutdown() => {
+                            break;
+                        }
+                        () = tokio::time::sleep(options.poll_interval) => {}
+                    }
                 }
             }
             Some(task) => {
