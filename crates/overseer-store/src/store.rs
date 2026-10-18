@@ -170,6 +170,29 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Pick the highest-priority eligible ready task whose dependencies are
+    /// all `done`. Among ties, the lowest id is chosen. Tasks with unmet
+    /// dependencies are skipped.
+    pub fn pick_next_ready_task(&self) -> Result<Option<Task>, StoreError> {
+        let sql = format!(
+            "{SELECT_TASK} WHERE status = 'ready' AND NOT EXISTS ( \
+                 SELECT 1 FROM task_deps d \
+                 LEFT JOIN tasks dep ON dep.id = d.depends_on \
+                 WHERE d.task_id = tasks.id AND (dep.status IS NULL OR dep.status != 'done') \
+             ) ORDER BY priority ASC, id ASC LIMIT 1"
+        );
+        let mut task = self
+            .conn
+            .query_row(&sql, [], task_from_row)
+            .optional()
+            .map_err(|source| StoreError::PickNextReadyTask { source })?;
+        if let Some(ref mut task) = task {
+            task.depends_on = load_deps(&self.conn, task.id)
+                .map_err(|source| StoreError::PickNextReadyTask { source })?;
+        }
+        Ok(task)
+    }
+
     pub fn set_status(&mut self, id: TaskId, status: TaskStatus) -> Result<(), StoreError> {
         let changed = self
             .conn
@@ -803,5 +826,159 @@ mod tests {
         }
         let reopened = Store::open(&path).unwrap();
         assert!(reopened.credits_low().unwrap());
+    }
+
+    #[test]
+    fn pick_next_ready_task_none_eligible() {
+        let mut store = memory_store();
+        // Empty store
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Only backlog tasks
+        store.add_task(new_task("backlog task", 0)).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Task with unmet dep
+        let dep = store.add_task(new_task("dep", 0)).unwrap();
+        let task = NewTask {
+            depends_on: vec![dep.id],
+            ..new_task("ready with unmet dep", 0)
+        };
+        let t = store.add_task(task).unwrap();
+        store.set_status(t.id, TaskStatus::Ready).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+    }
+
+    #[test]
+    fn pick_next_ready_task_deps_done() {
+        let mut store = memory_store();
+        let dep = store.add_task(new_task("dep", 0)).unwrap();
+        store.set_status(dep.id, TaskStatus::Done).unwrap();
+
+        let task = store
+            .add_task(NewTask {
+                depends_on: vec![dep.id],
+                ..new_task("ready task", 0)
+            })
+            .unwrap();
+        store.set_status(task.id, TaskStatus::Ready).unwrap();
+
+        let picked = store.pick_next_ready_task().unwrap();
+        assert!(picked.is_some());
+        let picked = picked.unwrap();
+        assert_eq!(picked.id, task.id);
+        assert_eq!(picked.depends_on, vec![dep.id]);
+    }
+
+    #[test]
+    fn pick_next_ready_task_deps_not_done() {
+        let mut store = memory_store();
+        let dep = store.add_task(new_task("dep", 0)).unwrap();
+        // dep is still Backlog
+        let task = store
+            .add_task(NewTask {
+                depends_on: vec![dep.id],
+                ..new_task("ready task", 0)
+            })
+            .unwrap();
+        store.set_status(task.id, TaskStatus::Ready).unwrap();
+
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Set dep to Running: still not done
+        store.set_status(dep.id, TaskStatus::Running).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Set dep to Review: still not done
+        store.set_status(dep.id, TaskStatus::Review).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Set dep to Blocked: still not done
+        store.set_status(dep.id, TaskStatus::Blocked).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+
+        // Set dep to Done: now eligible!
+        store.set_status(dep.id, TaskStatus::Done).unwrap();
+        let picked = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked.map(|t| t.id), Some(task.id));
+    }
+
+    #[test]
+    fn pick_next_ready_task_cycle_free_chain() {
+        let mut store = memory_store();
+        let t1 = store.add_task(new_task("step 1", 0)).unwrap();
+        let t2 = store
+            .add_task(NewTask {
+                depends_on: vec![t1.id],
+                ..new_task("step 2", 0)
+            })
+            .unwrap();
+        let t3 = store
+            .add_task(NewTask {
+                depends_on: vec![t2.id],
+                ..new_task("step 3", 0)
+            })
+            .unwrap();
+
+        // Mark all three Ready
+        store.set_status(t1.id, TaskStatus::Ready).unwrap();
+        store.set_status(t2.id, TaskStatus::Ready).unwrap();
+        store.set_status(t3.id, TaskStatus::Ready).unwrap();
+
+        // Initially only t1 has all deps done (0 deps)
+        let picked1 = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked1.map(|t| t.id), Some(t1.id));
+
+        // When t1 is Done, t2 becomes eligible
+        store.set_status(t1.id, TaskStatus::Done).unwrap();
+        let picked2 = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked2.map(|t| t.id), Some(t2.id));
+
+        // When t2 is Done, t3 becomes eligible
+        store.set_status(t2.id, TaskStatus::Done).unwrap();
+        let picked3 = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked3.map(|t| t.id), Some(t3.id));
+
+        // When t3 is Done, none eligible
+        store.set_status(t3.id, TaskStatus::Done).unwrap();
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
+    }
+
+    #[test]
+    fn pick_next_ready_task_priority_ordering() {
+        let mut store = memory_store();
+        let t_p10 = store.add_task(new_task("low urgency", 10)).unwrap();
+        let t_p5_a = store.add_task(new_task("medium urgency a", 5)).unwrap();
+        let t_p5_b = store.add_task(new_task("medium urgency b", 5)).unwrap();
+        let unmet = store.add_task(new_task("unmet dep", 0)).unwrap();
+        let t_p1_blocked = store
+            .add_task(NewTask {
+                depends_on: vec![unmet.id],
+                ..new_task("urgent but blocked by dep", 1)
+            })
+            .unwrap();
+
+        store.set_status(t_p10.id, TaskStatus::Ready).unwrap();
+        store.set_status(t_p5_a.id, TaskStatus::Ready).unwrap();
+        store.set_status(t_p5_b.id, TaskStatus::Ready).unwrap();
+        store
+            .set_status(t_p1_blocked.id, TaskStatus::Ready)
+            .unwrap();
+
+        // Lowest priority value first (5 < 10); among tie (t_p5_a vs t_p5_b), lowest id first
+        let picked = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked.map(|t| t.id), Some(t_p5_a.id));
+
+        store.set_status(t_p5_a.id, TaskStatus::Done).unwrap();
+        let picked = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked.map(|t| t.id), Some(t_p5_b.id));
+
+        store.set_status(t_p5_b.id, TaskStatus::Done).unwrap();
+        let picked = store.pick_next_ready_task().unwrap();
+        assert_eq!(picked.map(|t| t.id), Some(t_p10.id));
+
+        store.set_status(t_p10.id, TaskStatus::Done).unwrap();
+        // t_p1_blocked still has unmet dep
+        assert_eq!(store.pick_next_ready_task().unwrap(), None);
     }
 }

@@ -127,4 +127,10 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("failed to pick the next ready task")]
+    PickNextReadyTask {
+        #[source]
+        source: rusqlite::Error,
+    },
 }
