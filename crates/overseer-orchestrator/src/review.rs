@@ -765,12 +765,15 @@ pub async fn run_review_loop_with_backends(
                 return Ok(TaskStatus::Review);
             }
             ReviewOutcome::NeedsHuman => {
-                let reason = (overall == Verdict::Escalate).then(|| {
+                let reason = Some(if overall == Verdict::Escalate {
                     let first_esc = results.iter().find(|r| r.verdict == Verdict::Escalate);
                     match first_esc.and_then(|r| extract_escalate_bullet(&r.feedback)) {
                         Some(bullet) => format!("escalation: reviewer: {bullet}"),
                         None => "escalation: reviewer: no reason given".to_owned(),
                     }
+                } else {
+                    "escalation: review rework limit reached; review the latest feedback and approve to accept"
+                        .to_owned()
                 });
                 store
                     .set_status_with_reason(task_id, TaskStatus::NeedsHuman, reason.as_deref())
@@ -1442,6 +1445,15 @@ mod tests {
         let task = fix.store.get_task(task_id).unwrap();
         assert!(!task.approved);
         assert_eq!(task.status, TaskStatus::NeedsHuman);
+        let reason = task.reason.as_deref().expect("expected escalation reason");
+        assert!(
+            reason.starts_with("escalation"),
+            "expected prefix 'escalation', got {reason:?}"
+        );
+        assert_eq!(
+            reason,
+            "escalation: review rework limit reached; review the latest feedback and approve to accept"
+        );
     }
 
     #[tokio::test]
