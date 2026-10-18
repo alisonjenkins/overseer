@@ -155,10 +155,13 @@ fn run_diff(dir: &Path, id: i64, stat: bool) -> Result<ExitCode, CliError> {
 }
 
 fn reconcile(store: &mut overseer_store::Store, repo: &Path) -> Result<()> {
-    let tasks = store
+    let review_tasks = store
         .list_tasks(Some(TaskStatus::Review))
         .context("failed to list review tasks")?;
-    for task in tasks {
+    let needs_human_tasks = store
+        .list_tasks(Some(TaskStatus::NeedsHuman))
+        .context("failed to list needs-human tasks")?;
+    for task in review_tasks.into_iter().chain(needs_human_tasks) {
         let branch = overseer_orchestrator::branch_name(task.id);
         if let Ok(true) = overseer_orchestrator::branch_content_on_head(repo, &branch) {
             store
