@@ -15,7 +15,7 @@ const STARTER_TEMPLATE: &str = r#"# overseer.toml: where task worktrees come fro
 # task.
 #
 # To use claude first, set default_profile = "claude". It then falls back to
-# gemini, then local, whenever it cannot run.
+# gemini, then local-agent, whenever it cannot run.
 
 # Repository that task worktrees are created from.
 repo = {repo}
@@ -54,7 +54,7 @@ prompt_flag = "-p"
 # headless agy needs write-shell to edit files at all (accept-edits is auto-denied a command permission); safe because runs happen in a throwaway task worktree
 permissions = "write-shell"
 role_prompt = "You are a careful senior engineer."
-fallback = ["local"]
+fallback = ["local-agent"]
 # Extra arguments added for each permission level a run is granted. A level that
 # is not listed adds nothing.
 [profiles.permission_args]
@@ -73,21 +73,20 @@ metered = true
 # argument below take effect.
 permissions = "write-workdir"
 role_prompt = "You are a careful senior engineer."
-fallback = ["gemini", "local"]
+fallback = ["gemini", "local-agent"]
 [profiles.permission_args]
 read = ["--permission-mode", "plan"]
 write-workdir = ["--permission-mode", "acceptEdits"]
 write-shell = ["--dangerously-skip-permissions"]
 
-# Untested example of opencode's run command. The test suite never runs it and
-# its flags are not checked against any opencode version; check them before use.
+# runs the active local llama.cpp profile as an opencode agent that edits the task worktree; load a profile first with switch-local-profile.sh; no fallback
 [[profiles]]
-name = "opencode-local"
+name = "local-agent"
 backend = "command"
-command = ["opencode", "run"]
+command = ["~/.claude/skills/delegation/scripts/delegate-to-local-agent.sh", "{workdir}"]
+env = { LOCAL_LLM_AGENT_EDIT = "1" }
 permissions = "write-workdir"
-role_prompt = "You are a careful senior engineer."
-fallback = []
+timeout_secs = 1800
 "#;
 
 /// Which backend implementation a profile selects.
@@ -542,7 +541,7 @@ command = []
             Config::from_toml_str(&Config::starter_toml(Path::new("/work/project"))).unwrap();
         assert_eq!(config.default_profile, "local");
         let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["local", "gemini", "claude", "opencode-local"]);
+        assert_eq!(names, ["local", "gemini", "claude", "local-agent"]);
 
         let local = config.profile("local").unwrap();
         assert_eq!(local.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
@@ -560,6 +559,12 @@ command = []
             ),
             "{starter}"
         );
+        assert!(
+            starter.contains(
+                "runs the active local llama.cpp profile as an opencode agent that edits the task worktree; load a profile first with switch-local-profile.sh; no fallback"
+            ),
+            "{starter}"
+        );
 
         let gemini = config.profile("gemini").unwrap();
         assert_eq!(gemini.permissions, Permissions::WriteShell);
@@ -574,7 +579,7 @@ command = []
             )
         );
         assert_eq!(gemini.prompt_flag.as_deref(), Some("-p"));
-        assert_eq!(gemini.fallback, ["local"]);
+        assert_eq!(gemini.fallback, ["local-agent"]);
         assert_eq!(
             gemini.permission_args.get(&Permissions::Read),
             Some(&Vec::new())
@@ -589,12 +594,35 @@ command = []
         );
 
         let claude = config.profile("claude").unwrap();
-        assert_eq!(claude.fallback, ["gemini", "local"]);
+        assert_eq!(claude.fallback, ["gemini", "local-agent"]);
         assert!(claude.metered);
         assert_eq!(
             claude.permission_args.get(&Permissions::Read),
             Some(&vec!["--permission-mode".to_owned(), "plan".to_owned()])
         );
+
+        let local_agent = config.profile("local-agent").unwrap();
+        assert_eq!(local_agent.backend, BackendKind::Command);
+        assert_eq!(
+            local_agent.command.as_deref(),
+            Some(
+                &[
+                    "~/.claude/skills/delegation/scripts/delegate-to-local-agent.sh".to_owned(),
+                    "{workdir}".to_owned()
+                ][..]
+            )
+        );
+        assert_eq!(
+            local_agent
+                .env
+                .get("LOCAL_LLM_AGENT_EDIT")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(local_agent.permissions, Permissions::WriteWorkdir);
+        assert_eq!(local_agent.timeout_secs, 1800);
+        assert_eq!(local_agent.role_prompt, None);
+        assert!(local_agent.fallback.is_empty());
     }
 
     #[test]

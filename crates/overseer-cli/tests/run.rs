@@ -357,8 +357,13 @@ async fn init_writes_the_routing_profiles_with_comments() {
     let text = std::fs::read_to_string(fx.state.join("overseer.toml")).unwrap();
     assert!(text.contains("name = \"claude\""), "{text}");
     assert!(text.contains("name = \"gemini\""), "{text}");
-    assert!(text.contains("name = \"opencode-local\""), "{text}");
-    assert!(text.contains("# Untested example"), "{text}");
+    assert!(text.contains("name = \"local-agent\""), "{text}");
+    assert!(
+        text.contains(
+            "runs the active local llama.cpp profile as an opencode agent that edits the task worktree; load a profile first with switch-local-profile.sh; no fallback"
+        ),
+        "{text}"
+    );
     assert!(
         text.contains("agy must be signed in (run `agy` once interactively)"),
         "{text}"
