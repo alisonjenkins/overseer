@@ -50,6 +50,11 @@ pub enum Command {
         /// Id of the task to merge.
         id: i64,
     },
+    /// Land a reviewed task branch by pushing to remote and opening a PR.
+    Land {
+        /// Id of the task to land.
+        id: i64,
+    },
     /// Discard a task's worktree and branch, returning it to backlog.
     Discard {
         /// Id of the task to discard.

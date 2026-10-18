@@ -106,6 +106,7 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
         }
         Command::Diff { id, stat } => run_diff(&dir, id, stat),
         Command::Merge { id } => run_merge(&dir, id),
+        Command::Land { id } => run_land(&dir, id),
         Command::Discard { id } => run_discard(&dir, id),
         Command::Review { id } => run_review(&dir, id),
         Command::Approve { id } => run_approve(&dir, id),
@@ -237,6 +238,39 @@ fn run_merge(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
         .set_status(task_id, TaskStatus::Done)
         .context("failed to set task status to done")?;
     println!("{sha}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_land(dir: &Path, id: i64) -> Result<ExitCode, CliError> {
+    let config = state::load_config(dir)?;
+    let mut store = state::open_existing_store(dir)?;
+    let task_id = TaskId::new(id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let outcome = runtime
+        .block_on(overseer_orchestrator::land(
+            &mut store, &config, dir, task_id,
+        ))
+        .map_err(|err| match err {
+            overseer_orchestrator::LandingError::Refusal(msg) => CliError::Refusal(msg),
+            overseer_orchestrator::LandingError::TestFailed { command, output } => {
+                CliError::Refusal(format!("test command `{command}` failed:\n{output}"))
+            }
+            other => CliError::Other(
+                anyhow::Error::from(other).context(format!("failed to land task {id}")),
+            ),
+        })?;
+    match outcome {
+        overseer_orchestrator::LandOutcome::PrOpened { url } => {
+            println!("{url}");
+            println!("PR opened; merge it when ready");
+        }
+        overseer_orchestrator::LandOutcome::Merged { commit } => {
+            println!("{commit}");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 

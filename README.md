@@ -110,6 +110,7 @@ overseer review 1
 overseer task show 1
 overseer approve 1
 overseer merge 1
+overseer land 1
 overseer discard 1
 ```
 
@@ -132,6 +133,9 @@ overseer discard 1
   from status `review`. If the task has recorded reviews but has not been
   approved, a warning is printed (`warning: task <id> has reviews and is not approved`)
   before merging.
+- `overseer land <id>` rebases a reviewed task branch onto the remote base
+  branch, runs the test command, pushes to the remote, opens or reuses a PR via
+  `gh`, and optionally fast-forward merges if `auto_merge` is true.
 - `overseer discard <id>` removes the task worktree and branch (`git branch -D`)
   and resets the task status to `backlog`. It refuses unless the task status is
   `review` or `blocked`.
@@ -567,6 +571,17 @@ The optional `[review]` table in `overseer.toml` configures automated code revie
 | `rework_profile` | string | none | Profile used for rework runs. Defaults to the task's own profile. |
 
 Review configuration is validated on load: reviewer profile names and `rework_profile` must exist in `[[profiles]]`.
+
+## Landing field reference
+
+The optional `[landing]` table in `overseer.toml` configures automated branch landing:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `remote` | string | `"origin"` | Remote to fetch and push to. |
+| `base` | string | `"main"` | Base branch to rebase onto and target for pull requests. |
+| `auto_merge` | bool | `false` | When true, fast-forward merges the branch if all gates pass. |
+| `test_command` | string | none | Command run via `sh -c` before pushing; required for auto-merge. |
 
 ## Escalation field reference
 
