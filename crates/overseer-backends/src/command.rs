@@ -44,6 +44,7 @@ pub struct CommandBackend {
     program: String,
     args: Vec<String>,
     prompt_stdin: bool,
+    prompt_flag: Option<String>,
     timeout: Duration,
     ceiling: Permissions,
     permission_args: BTreeMap<Permissions, Vec<String>>,
@@ -65,6 +66,7 @@ impl CommandBackend {
             program: program.clone(),
             args: args.to_vec(),
             prompt_stdin: profile.prompt_stdin,
+            prompt_flag: profile.prompt_flag.clone(),
             timeout: Duration::from_secs(profile.timeout_secs),
             ceiling: profile.permissions,
             permission_args: profile.permission_args.clone(),
@@ -98,6 +100,9 @@ impl Backend for CommandBackend {
         if self.prompt_stdin {
             command.stdin(Stdio::piped());
         } else {
+            if let Some(flag) = &self.prompt_flag {
+                command.arg(flag);
+            }
             command.stdin(Stdio::null()).arg(&prompt);
         }
 
@@ -482,5 +487,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.failure, Some(QuotaExhausted));
+    }
+
+    fn write_script(path: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn prompt_flag_appends_flag_and_prompt_after_permission_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("recorded_argv.txt");
+        let script = write_script(
+            &dir.path().join("fake_cli.sh"),
+            &format!(
+                r#"for a in "$@"; do printf '[%s]' "$a"; done > "{}"
+echo "fake ran"
+"#,
+                log.display()
+            ),
+        );
+        let mut agent = profile(
+            &["/bin/sh", script.to_str().unwrap(), "subcmd", "--verbose"],
+            false,
+            10,
+        );
+        agent.prompt_flag = Some("-p".to_owned());
+        agent.permission_args.insert(
+            Permissions::WriteWorkdir,
+            vec!["--mode".to_owned(), "accept-edits".to_owned()],
+        );
+        let backend = CommandBackend::new(&agent).unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "the prompt"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, None);
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            recorded,
+            "[subcmd][--verbose][--mode][accept-edits][-p][the prompt]"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_flag_ignored_in_stdin_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("recorded_stdin_argv.txt");
+        let script = write_script(
+            &dir.path().join("fake_stdin_cli.sh"),
+            &format!(
+                r#"for a in "$@"; do printf '[%s]' "$a"; done > "{}"
+cat > /dev/null
+echo "fake ran"
+"#,
+                log.display()
+            ),
+        );
+        let mut agent = profile(&["/bin/sh", script.to_str().unwrap()], true, 10);
+        agent.prompt_flag = Some("-p".to_owned());
+        let backend = CommandBackend::new(&agent).unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "from stdin"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, None);
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(recorded, "");
     }
 }
