@@ -363,4 +363,10 @@ async fn init_writes_the_routing_profiles_with_comments() {
         text.contains("agy must be signed in (run `agy` once interactively)"),
         "{text}"
     );
+    assert!(
+        text.contains(
+            "headless agy needs write-shell to edit files at all (accept-edits is auto-denied a command permission); safe because runs happen in a throwaway task worktree"
+        ),
+        "{text}"
+    );
 }

@@ -51,7 +51,8 @@ name = "gemini"
 backend = "command"
 command = ["agy", "--model", "gemini-3.8-flash-medium"]
 prompt_flag = "-p"
-permissions = "write-workdir"
+# headless agy needs write-shell to edit files at all (accept-edits is auto-denied a command permission); safe because runs happen in a throwaway task worktree
+permissions = "write-shell"
 role_prompt = "You are a careful senior engineer."
 fallback = ["local"]
 # Extra arguments added for each permission level a run is granted. A level that
@@ -536,8 +537,15 @@ command = []
             starter.contains("agy must be signed in (run `agy` once interactively)"),
             "{starter}"
         );
+        assert!(
+            starter.contains(
+                "headless agy needs write-shell to edit files at all (accept-edits is auto-denied a command permission); safe because runs happen in a throwaway task worktree"
+            ),
+            "{starter}"
+        );
 
         let gemini = config.profile("gemini").unwrap();
+        assert_eq!(gemini.permissions, Permissions::WriteShell);
         assert_eq!(
             gemini.command.as_deref(),
             Some(
