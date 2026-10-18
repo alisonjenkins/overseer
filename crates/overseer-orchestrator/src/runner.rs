@@ -521,6 +521,7 @@ mod tests {
             timeout_secs: 5,
             metered: false,
             permission_args: Default::default(),
+            env: Default::default(),
         }
     }
 

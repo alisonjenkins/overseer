@@ -79,6 +79,7 @@ mod tests {
             timeout_secs: 10,
             metered,
             permission_args: Default::default(),
+            env: Default::default(),
         }
     }
 

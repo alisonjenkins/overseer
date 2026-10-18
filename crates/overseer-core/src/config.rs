@@ -144,6 +144,10 @@ pub struct Profile {
     /// effective permission level. A level with no entry adds nothing.
     #[serde(default)]
     pub permission_args: BTreeMap<Permissions, Vec<String>>,
+    /// Environment variables set on the spawned process for a `command`
+    /// backend. Values are plain strings, not secrets.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Profile {
@@ -212,6 +216,7 @@ impl Config {
                 });
             }
             check_required_fields(profile)?;
+            check_env_keys(profile)?;
         }
 
         if !by_name.contains_key(self.default_profile.as_str()) {
@@ -262,6 +267,18 @@ fn check_required_fields(profile: &Profile) -> Result<(), CoreError> {
         return Err(CoreError::PromptFlagWithStdin {
             profile: profile.name.clone(),
         });
+    }
+    Ok(())
+}
+
+fn check_env_keys(profile: &Profile) -> Result<(), CoreError> {
+    for key in profile.env.keys() {
+        if key.is_empty() || key.contains('=') {
+            return Err(CoreError::InvalidEnvKey {
+                profile: profile.name.clone(),
+                key: key.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -633,6 +650,67 @@ command = []
         let profile = config.profile("local").unwrap();
         assert!(!profile.metered);
         assert!(profile.permission_args.is_empty());
+        assert!(profile.env.is_empty());
+    }
+
+    #[test]
+    fn command_profile_parses_env() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["tool"]
+env = { FOO = "bar", BAZ = "qux" }
+"#;
+        let config = Config::from_toml_str(text).unwrap();
+        let profile = config.profile("agent").unwrap();
+        assert_eq!(profile.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(profile.env.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    #[test]
+    fn empty_env_key_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["tool"]
+env = { "" = "val" }
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::InvalidEnvKey {
+                profile: "agent".to_owned(),
+                key: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn env_key_with_equals_is_rejected() {
+        let text = r#"
+repo = "/work/project"
+default_profile = "agent"
+
+[[profiles]]
+name = "agent"
+backend = "command"
+command = ["tool"]
+env = { "FOO=BAR" = "val" }
+"#;
+        assert_eq!(
+            parse_err(text),
+            CoreError::InvalidEnvKey {
+                profile: "agent".to_owned(),
+                key: "FOO=BAR".to_owned(),
+            }
+        );
     }
 
     #[test]

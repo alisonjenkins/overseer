@@ -48,4 +48,9 @@ pub enum CoreError {
 
     #[error("profile {profile:?} sets prompt_flag together with prompt_stdin = true")]
     PromptFlagWithStdin { profile: String },
+
+    #[error(
+        "profile {profile:?} has invalid env key {key:?}; keys must be non-empty and contain no '='"
+    )]
+    InvalidEnvKey { profile: String, key: String },
 }
