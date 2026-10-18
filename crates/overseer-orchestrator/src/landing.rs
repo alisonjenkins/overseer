@@ -387,6 +387,8 @@ mod tests {
                 profile: None,
                 depends_on: Vec::new(),
                 ready: true,
+                source: None,
+                external_id: None,
             })
             .unwrap()
     }

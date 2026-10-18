@@ -701,6 +701,8 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
                     profile,
                     depends_on: depends_on.into_iter().map(TaskId::new).collect(),
                     ready,
+                    source: None,
+                    external_id: None,
                 })
                 .context("failed to add task")?;
             tracing::info!(task_id = task.id.get(), "task added");

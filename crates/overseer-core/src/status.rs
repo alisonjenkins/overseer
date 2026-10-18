@@ -12,10 +12,11 @@ pub enum TaskStatus {
     Blocked,
     NeedsHuman,
     Done,
+    Cancelled,
 }
 
 impl TaskStatus {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Backlog,
         Self::Ready,
         Self::Running,
@@ -23,6 +24,7 @@ impl TaskStatus {
         Self::Blocked,
         Self::NeedsHuman,
         Self::Done,
+        Self::Cancelled,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -34,6 +36,7 @@ impl TaskStatus {
             Self::Blocked => "blocked",
             Self::NeedsHuman => "needs-human",
             Self::Done => "done",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -81,6 +84,7 @@ mod tests {
             (TaskStatus::Blocked, "blocked"),
             (TaskStatus::NeedsHuman, "needs-human"),
             (TaskStatus::Done, "done"),
+            (TaskStatus::Cancelled, "cancelled"),
         ];
         for (status, text) in expected {
             assert_eq!(status.to_string(), text);

@@ -240,4 +240,26 @@ pub enum StoreError {
 
     #[error("invalid skill name {name:?}; must match [a-z0-9-]+")]
     InvalidSkillName { name: String },
+
+    #[error("failed to find task with external id {external_id:?} from source {task_source:?}")]
+    FindTaskByExternalId {
+        task_source: Box<str>,
+        external_id: Box<str>,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
+
+    #[error("failed to list tasks for source {task_source:?}")]
+    ListTasksBySource {
+        task_source: Box<str>,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
+
+    #[error("failed to update title and body of task {id}")]
+    SetTaskTitleAndBody {
+        id: TaskId,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
 }

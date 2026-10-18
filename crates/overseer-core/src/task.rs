@@ -28,6 +28,8 @@ pub struct NewTask {
     pub profile: Option<String>,
     pub depends_on: Vec<TaskId>,
     pub ready: bool,
+    pub source: Option<String>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,4 +47,6 @@ pub struct Task {
     /// ISO8601 UTC, e.g. `2026-10-18T08:00:00Z`.
     pub created_at: String,
     pub reason: Option<String>,
+    pub source: Option<String>,
+    pub external_id: Option<String>,
 }

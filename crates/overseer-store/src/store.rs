@@ -18,13 +18,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/0004_reviews.sql")),
     (5, include_str!("../migrations/0005_lessons.sql")),
     (6, include_str!("../migrations/0006_reason.sql")),
+    (7, include_str!("../migrations/0007_source_external_id.sql")),
 ];
 
 /// Settings key holding the `credits_low` mode flag, stored as `"true"` or
 /// `"false"`.
 const CREDITS_LOW_KEY: &str = "credits_low";
 
-const SELECT_TASK: &str = "SELECT id, title, body, status, priority, profile, round, approved, created_at, reason FROM tasks";
+const SELECT_TASK: &str = "SELECT id, title, body, status, priority, profile, round, approved, created_at, reason, source, external_id FROM tasks";
 
 const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
      input_tokens, output_tokens, failure, transcript_path, branch, skills FROM runs";
@@ -75,6 +76,8 @@ impl Store {
             profile,
             mut depends_on,
             ready,
+            source,
+            external_id,
         } = new;
         depends_on.sort_unstable();
         depends_on.dedup();
@@ -112,9 +115,18 @@ impl Store {
         }
 
         tx.execute(
-            "INSERT INTO tasks (title, body, status, priority, profile, round, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![title, body, status.as_str(), priority, profile, created_at],
+            "INSERT INTO tasks (title, body, status, priority, profile, round, created_at, source, external_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
+            params![
+                title,
+                body,
+                status.as_str(),
+                priority,
+                profile,
+                created_at,
+                source,
+                external_id,
+            ],
         )
         .map_err(|source| StoreError::InsertTask {
             title: title.clone(),
@@ -150,6 +162,8 @@ impl Store {
             depends_on,
             created_at,
             reason: None,
+            source,
+            external_id,
         })
     }
 
@@ -194,6 +208,54 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Find a task by its source and external id.
+    pub fn find_task_by_external_id(
+        &self,
+        source: &str,
+        external_id: &str,
+    ) -> Result<Option<Task>, StoreError> {
+        let err_fn = |err| StoreError::FindTaskByExternalId {
+            task_source: source.into(),
+            external_id: external_id.into(),
+            source: Box::new(err),
+        };
+        let mut task = self
+            .conn
+            .query_row(
+                &format!("{SELECT_TASK} WHERE source = ?1 AND external_id = ?2"),
+                params![source, external_id],
+                task_from_row,
+            )
+            .optional()
+            .map_err(err_fn)?;
+        if let Some(ref mut task) = task {
+            task.depends_on = load_deps(&self.conn, task.id).map_err(err_fn)?;
+        }
+        Ok(task)
+    }
+
+    /// List all tasks from a given source, ordered by id ascending.
+    pub fn list_tasks_by_source(&self, source: &str) -> Result<Vec<Task>, StoreError> {
+        let list_err = |err| StoreError::ListTasksBySource {
+            task_source: source.into(),
+            source: Box::new(err),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SELECT_TASK} WHERE source = ?1 ORDER BY id ASC"))
+            .map_err(list_err)?;
+        let mut tasks = stmt
+            .query_map(params![source], task_from_row)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Task>>>())
+            .map_err(list_err)?;
+
+        for task in &mut tasks {
+            task.depends_on = load_deps(&self.conn, task.id).map_err(list_err)?;
+        }
+        Ok(tasks)
+    }
+
     /// Returns the counts of tasks grouped by status for all task statuses.
     pub fn task_counts_by_status(&self) -> Result<Vec<(TaskStatus, usize)>, StoreError> {
         let mut counts = std::collections::HashMap::new();
@@ -217,15 +279,7 @@ impl Store {
             }
         }
 
-        let all_statuses = [
-            TaskStatus::Backlog,
-            TaskStatus::Ready,
-            TaskStatus::Running,
-            TaskStatus::Review,
-            TaskStatus::Blocked,
-            TaskStatus::NeedsHuman,
-            TaskStatus::Done,
-        ];
+        let all_statuses = TaskStatus::ALL;
 
         Ok(all_statuses
             .iter()
@@ -278,6 +332,29 @@ impl Store {
     /// Set the status of a task to the given status.
     pub fn set_status(&mut self, id: TaskId, status: TaskStatus) -> Result<(), StoreError> {
         self.set_status_with_reason(id, status, None)
+    }
+
+    /// Update the title and body of a task.
+    pub fn set_task_title_and_body(
+        &mut self,
+        id: TaskId,
+        title: &str,
+        body: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET title = ?1, body = ?2 WHERE id = ?3",
+                params![title, body, id.get()],
+            )
+            .map_err(|source| StoreError::SetTaskTitleAndBody {
+                id,
+                source: Box::new(source),
+            })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownTask { id });
+        }
+        Ok(())
     }
 
     /// Atomically move a `backlog` or `blocked` task to `ready`. Any other
@@ -710,6 +787,8 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(err)))?;
     let approved: bool = row.get(7)?;
     let reason: Option<String> = row.get(9)?;
+    let source: Option<String> = row.get(10)?;
+    let external_id: Option<String> = row.get(11)?;
     Ok(Task {
         id: TaskId::new(row.get(0)?),
         title: row.get(1)?,
@@ -722,6 +801,8 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         depends_on: Vec::new(),
         created_at: row.get(8)?,
         reason,
+        source,
+        external_id,
     })
 }
 
@@ -847,6 +928,8 @@ mod tests {
                 profile: Some("local".to_owned()),
                 depends_on: Vec::new(),
                 ready: false,
+                source: None,
+                external_id: None,
             })
             .unwrap();
 
@@ -859,6 +942,8 @@ mod tests {
         assert_eq!(task.round, 0);
         assert!(task.depends_on.is_empty());
         assert!(task.created_at.ends_with('Z'), "{}", task.created_at);
+        assert_eq!(task.source, None);
+        assert_eq!(task.external_id, None);
     }
 
     #[test]
@@ -1448,6 +1533,7 @@ mod tests {
         assert_eq!(map.get(&TaskStatus::Blocked), Some(&0));
         assert_eq!(map.get(&TaskStatus::NeedsHuman), Some(&0));
         assert_eq!(map.get(&TaskStatus::Done), Some(&0));
+        assert_eq!(map.get(&TaskStatus::Cancelled), Some(&0));
     }
 
     #[test]
@@ -1809,6 +1895,140 @@ mod tests {
         assert_eq!(
             task.reason.as_deref(),
             Some("escalation: .github/workflows/ci.yml")
+        );
+    }
+
+    #[test]
+    fn find_task_by_external_id_finds_task() {
+        let mut store = memory_store();
+        let added = store
+            .add_task(NewTask {
+                source: Some("specs/auth.md".to_owned()),
+                external_id: Some("task-42".to_owned()),
+                ..new_task("auth task", 0)
+            })
+            .unwrap();
+
+        let found = store
+            .find_task_by_external_id("specs/auth.md", "task-42")
+            .unwrap();
+        assert_eq!(found, Some(added));
+
+        let not_found = store
+            .find_task_by_external_id("specs/auth.md", "missing")
+            .unwrap();
+        assert_eq!(not_found, None);
+
+        let wrong_source = store
+            .find_task_by_external_id("specs/other.md", "task-42")
+            .unwrap();
+        assert_eq!(wrong_source, None);
+    }
+
+    #[test]
+    fn add_task_with_duplicate_source_and_external_id_fails() {
+        let mut store = memory_store();
+        store
+            .add_task(NewTask {
+                source: Some("specs/feature.md".to_owned()),
+                external_id: Some("id-1".to_owned()),
+                ..new_task("first", 0)
+            })
+            .unwrap();
+
+        let err = store
+            .add_task(NewTask {
+                source: Some("specs/feature.md".to_owned()),
+                external_id: Some("id-1".to_owned()),
+                ..new_task("duplicate", 0)
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::InsertTask { .. }),
+            "expected InsertTask error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn add_task_null_external_ids_can_coexist() {
+        let mut store = memory_store();
+        let t1 = store
+            .add_task(NewTask {
+                source: Some("specs/feature.md".to_owned()),
+                ..new_task("first null ext id", 0)
+            })
+            .unwrap();
+
+        let t2 = store
+            .add_task(NewTask {
+                source: Some("specs/feature.md".to_owned()),
+                ..new_task("second null ext id", 0)
+            })
+            .unwrap();
+
+        let t3 = store.add_task(new_task("both null", 0)).unwrap();
+
+        assert_ne!(t1.id, t2.id);
+        assert_ne!(t2.id, t3.id);
+    }
+
+    #[test]
+    fn list_tasks_by_source_returns_only_matching_tasks() {
+        let mut store = memory_store();
+        let t1 = store
+            .add_task(NewTask {
+                source: Some("specs/a.md".to_owned()),
+                external_id: Some("1".to_owned()),
+                ..new_task("a1", 10)
+            })
+            .unwrap();
+        let _t_other = store
+            .add_task(NewTask {
+                source: Some("specs/b.md".to_owned()),
+                external_id: Some("1".to_owned()),
+                ..new_task("b1", 0)
+            })
+            .unwrap();
+        let t2 = store
+            .add_task(NewTask {
+                source: Some("specs/a.md".to_owned()),
+                external_id: Some("2".to_owned()),
+                ..new_task("a2", 5)
+            })
+            .unwrap();
+
+        let tasks = store.list_tasks_by_source("specs/a.md").unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, t1.id);
+        assert_eq!(tasks[1].id, t2.id);
+        assert_eq!(tasks[0].title, "a1");
+        assert_eq!(tasks[1].title, "a2");
+
+        let empty = store.list_tasks_by_source("specs/empty.md").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn set_task_title_and_body_changes_stored_title_and_body() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("initial title", 0)).unwrap();
+        assert_eq!(task.body, "");
+
+        store
+            .set_task_title_and_body(task.id, "updated title", "updated body")
+            .unwrap();
+
+        let updated = store.get_task(task.id).unwrap();
+        assert_eq!(updated.title, "updated title");
+        assert_eq!(updated.body, "updated body");
+
+        let err = store
+            .set_task_title_and_body(TaskId::new(999), "title", "body")
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnknownTask { id } if id == TaskId::new(999)),
+            "unexpected error: {err:?}"
         );
     }
 }

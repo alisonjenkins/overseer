@@ -24,7 +24,7 @@ pub use task::{NewTask, Task, TaskId};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CoreError {
     #[error(
-        "unknown task status {value:?}; expected one of backlog, ready, running, review, blocked, needs-human, done"
+        "unknown task status {value:?}; expected one of backlog, ready, running, review, blocked, needs-human, done, cancelled"
     )]
     UnknownStatus { value: String },
 
