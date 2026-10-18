@@ -43,6 +43,8 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens the database at `path` and runs migrations.
+    /// Returns a `StoreError` on failure.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(|source| StoreError::OpenDatabase {
             path: path.to_path_buf(),
