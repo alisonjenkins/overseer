@@ -14,6 +14,7 @@ overseer-backends = { version = "0.1.0", path = "../overseer-backends" }
 overseer-core = { version = "0.1.0", path = "../overseer-core" }
 overseer-store = { version = "0.1.0", path = "../overseer-store" }
 futures-util = "0.3"
+globset = "0.4.16"
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing = "0.1.44"

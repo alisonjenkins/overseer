@@ -2,6 +2,7 @@
 //! the backend, records the run, commits the result and sets the task status.
 
 pub mod doctor;
+pub mod escalation;
 pub mod learning;
 mod lock;
 mod recovery;
@@ -15,6 +16,7 @@ mod worktree;
 mod test_support;
 
 pub use doctor::{PlanEntry, ProfileReport, Report, Verdict, doctor_report};
+pub use escalation::escalation_hits;
 pub use learning::{
     RetrospectError, has_learning_signal, retrospect_task, retrospect_task_with_backend,
     retrospect_task_with_backends,
