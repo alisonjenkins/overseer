@@ -51,6 +51,7 @@ pub struct CommandBackend {
     timeout: Duration,
     ceiling: Permissions,
     permission_args: BTreeMap<Permissions, Vec<String>>,
+    env: BTreeMap<String, String>,
 }
 
 impl CommandBackend {
@@ -73,6 +74,7 @@ impl CommandBackend {
             timeout: Duration::from_secs(profile.timeout_secs),
             ceiling: profile.permissions,
             permission_args: profile.permission_args.clone(),
+            env: profile.env.clone(),
         })
     }
 }
@@ -91,10 +93,31 @@ impl Backend for CommandBackend {
         };
 
         let effective = self.ceiling.min(req.permissions);
-        let mut command = tokio::process::Command::new(&self.program);
+        let abs_workdir = match std::path::absolute(&req.workdir) {
+            Ok(p) => p,
+            Err(_) => req.workdir.clone(),
+        };
+        let workdir_str = abs_workdir.to_string_lossy();
+        let program = self.program.replace("{workdir}", &workdir_str);
+        let program = expand_tilde(&program);
+        let args: Vec<String> = self
+            .args
+            .iter()
+            .map(|arg| arg.replace("{workdir}", &workdir_str))
+            .collect();
+        let perm_args: Vec<String> = self
+            .permission_args
+            .get(&effective)
+            .into_iter()
+            .flatten()
+            .map(|arg| arg.replace("{workdir}", &workdir_str))
+            .collect();
+
+        let mut command = tokio::process::Command::new(&program);
         command
-            .args(&self.args)
-            .args(self.permission_args.get(&effective).into_iter().flatten())
+            .args(&args)
+            .args(&perm_args)
+            .envs(&self.env)
             .current_dir(&req.workdir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,16 +132,27 @@ impl Backend for CommandBackend {
             command.stdin(Stdio::null()).arg(&prompt);
         }
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(source) => {
-                tracing::warn!(
-                    profile = %self.profile_name,
-                    program = %self.program,
-                    error = %source,
-                    "command backend could not start its program"
-                );
-                return Ok(failed(FailureKind::Unreachable));
+        let mut child = {
+            let mut attempts = 0u8;
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 5 =>
+                    {
+                        attempts = attempts.saturating_add(1);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(source) => {
+                        tracing::warn!(
+                            profile = %self.profile_name,
+                            program = %program,
+                            error = %source,
+                            "command backend could not start its program"
+                        );
+                        return Ok(failed(FailureKind::Unreachable));
+                    }
+                }
             }
         };
 
@@ -192,6 +226,16 @@ fn classify_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Failu
         "exit {code}: {}",
         tail(stderr, STDERR_EXCERPT_CHARS)
     ))
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let home = home.trim_end_matches('/');
+        return format!("{home}/{rest}");
+    }
+    path.to_owned()
 }
 
 #[cfg(test)]
@@ -601,5 +645,115 @@ echo "fake ran"
         assert_eq!(outcome.failure, None);
         let recorded = std::fs::read_to_string(&log).unwrap();
         assert_eq!(recorded, "");
+    }
+
+    #[tokio::test]
+    async fn command_sets_env_and_substitutes_workdir_without_modifying_parent_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        let log = dir.path().join("fake_out.txt");
+        let script = write_script(
+            &dir.path().join("fake_env_subst.sh"),
+            &format!(
+                r#"echo "argv:$*" > "{}"
+echo "FOO:$FOO" >> "{}"
+echo "fake ran"
+"#,
+                log.display(),
+                log.display()
+            ),
+        );
+        let mut agent = profile(
+            &[
+                script.to_str().unwrap(),
+                "--workdir={workdir}",
+                "{workdir}",
+                "literal",
+            ],
+            false,
+            10,
+        );
+        agent.permission_args.insert(
+            Permissions::WriteWorkdir,
+            vec![
+                "--perm-workdir={workdir}".to_owned(),
+                "{workdir}".to_owned(),
+            ],
+        );
+        agent
+            .env
+            .insert("FOO".to_owned(), "custom_env_value".to_owned());
+
+        let parent_foo_before = std::env::var("FOO");
+
+        let backend = CommandBackend::new(&agent).unwrap();
+        let outcome = backend
+            .run(&request(workdir.clone(), None, "prompt-arg"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.failure, None);
+
+        let parent_foo_after = std::env::var("FOO");
+        assert_eq!(parent_foo_before, parent_foo_after);
+
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        let abs_workdir = std::path::absolute(&workdir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            recorded.contains("FOO:custom_env_value"),
+            "expected FOO to be custom_env_value, got:\n{recorded}"
+        );
+        assert!(
+            recorded.contains(&format!(
+                "argv:--workdir={abs_workdir} {abs_workdir} literal --perm-workdir={abs_workdir} {abs_workdir} prompt-arg"
+            )),
+            "expected argv substitution, got:\n{recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_expands_leading_tilde_in_program() {
+        let home = std::env::var("HOME").unwrap();
+        let home_path = PathBuf::from(&home);
+        let current_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir_in(&current_dir).unwrap();
+        let log = temp_dir.path().join("tilde_out.txt");
+        let script = write_script(
+            &temp_dir.path().join("fake_tilde.sh"),
+            &format!(
+                r#"echo "ran" > "{}"
+echo "fake ran"
+"#,
+                log.display()
+            ),
+        );
+        let rel = script.strip_prefix(&home_path).unwrap();
+        let tilde_path = format!("~/{}", rel.display());
+
+        let agent = profile(&[&tilde_path, "arg1"], false, 10);
+        let backend = CommandBackend::new(&agent).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = backend
+            .run(&request(dir.path().to_path_buf(), None, "prompt"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "ran");
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        let home_trimmed = home.trim_end_matches('/');
+        assert_eq!(
+            expand_tilde("~/bin/tool"),
+            format!("{home_trimmed}/bin/tool")
+        );
+        assert_eq!(expand_tilde("/usr/bin/tool"), "/usr/bin/tool");
+        assert_eq!(expand_tilde("~other/tool"), "~other/tool");
     }
 }
