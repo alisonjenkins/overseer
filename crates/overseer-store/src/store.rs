@@ -576,6 +576,17 @@ impl Store {
         })
     }
 
+    pub fn update_lesson_path(&mut self, id: LessonId, path: &Path) -> Result<(), StoreError> {
+        let path_str = path.to_string_lossy().into_owned();
+        self.conn
+            .execute(
+                "UPDATE lessons SET path = ?1 WHERE id = ?2",
+                params![path_str, id.get()],
+            )
+            .map_err(|source| StoreError::UpdateLessonPath { id, source })?;
+        Ok(())
+    }
+
     pub fn get_lesson(&self, id: LessonId) -> Result<Lesson, StoreError> {
         self.conn
             .query_row(
@@ -1599,6 +1610,12 @@ mod tests {
         assert_eq!(lesson.status, LessonStatus::Proposed);
         assert_eq!(lesson.path, PathBuf::from("/state/lessons/1.md"));
         assert!(lesson.created_at.ends_with('Z'));
+
+        store
+            .update_lesson_path(lesson.id, &PathBuf::from("/state/lessons/final.md"))
+            .unwrap();
+        let loaded = store.get_lesson(lesson.id).unwrap();
+        assert_eq!(loaded.path, PathBuf::from("/state/lessons/final.md"));
     }
 
     #[test]

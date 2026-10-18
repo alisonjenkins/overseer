@@ -191,6 +191,13 @@ pub enum StoreError {
         source: rusqlite::Error,
     },
 
+    #[error("failed to update path of lesson {id}")]
+    UpdateLessonPath {
+        id: LessonId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
     #[error("failed to load lesson {id}")]
     LoadLesson {
         id: LessonId,

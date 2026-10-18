@@ -140,6 +140,33 @@ pub async fn run_worker(
                 } else {
                     stats.tasks_blocked = stats.tasks_blocked.saturating_add(1);
                 }
+
+                if config.learning.profile.is_some()
+                    && (summary.status == TaskStatus::Review
+                        || summary.status == TaskStatus::Blocked
+                        || summary.status == TaskStatus::NeedsHuman)
+                {
+                    let runs = store.list_runs(task.id).map_err(WorkerError::Store)?;
+                    let current_task = store.get_task(task.id).map_err(WorkerError::Store)?;
+                    if !config.learning.min_signal
+                        || crate::learning::has_learning_signal(&current_task, &runs)
+                    {
+                        match crate::learning::retrospect_task(store, config, state_dir, task.id)
+                            .await
+                        {
+                            Ok(Some(lesson)) => {
+                                println!(
+                                    "lesson {} proposed for skill {}",
+                                    lesson.id, lesson.skill
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(task_id = task.id.get(), %err, "retrospective failed");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -493,5 +520,68 @@ mod tests {
         let reviews = fx.store.list_reviews(t.id).unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].verdict, overseer_core::Verdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn worker_triggers_retrospective_when_signal_passes() {
+        let mut fx = fixture();
+        let mut config = test_config(&fx.repo);
+        config
+            .profiles
+            .push(fake_command_profile("learner", "echo 'Always test first.'"));
+        config.learning.profile = Some("learner".to_owned());
+        config.learning.skill = Some("general".to_owned());
+        config.learning.min_signal = true;
+
+        let (_tx, shutdown) = shutdown_pair();
+
+        let t1 = fx
+            .store
+            .add_task(NewTask {
+                title: "failing task".to_owned(),
+                profile: Some("fail".to_owned()),
+                ready: true,
+                priority: 1,
+                ..NewTask::default()
+            })
+            .unwrap();
+
+        let stats = run_worker(
+            &mut fx.store,
+            &config,
+            &fx.state,
+            WorkerOptions {
+                once: true,
+                max_tasks: Some(1),
+                poll_interval: Duration::from_millis(10),
+            },
+            shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.tasks_executed, 1);
+        assert_eq!(stats.tasks_blocked, 1);
+        assert_eq!(
+            fx.store.get_task(t1.id).unwrap().status,
+            TaskStatus::Blocked
+        );
+
+        let lessons = fx.store.list_lessons(None).unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].task_id, t1.id);
+        assert_eq!(lessons[0].skill, "general");
+        assert_eq!(lessons[0].status, overseer_core::LessonStatus::Proposed);
+
+        let md_file = fx
+            .state
+            .join("lessons")
+            .join(format!("{}.md", lessons[0].id));
+        let diff_file = fx
+            .state
+            .join("lessons")
+            .join(format!("{}.diff", lessons[0].id));
+        assert!(md_file.is_file());
+        assert!(diff_file.is_file());
     }
 }
