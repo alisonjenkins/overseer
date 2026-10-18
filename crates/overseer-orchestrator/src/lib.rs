@@ -11,5 +11,6 @@ mod test_support;
 pub use router::{RouterError, plan_attempts};
 pub use runner::{RunSummary, RunnerError, run_task, run_task_with_backend};
 pub use worktree::{
-    Worktree, WorktreeError, branch_name, diff, diff_stat, remove_worktree, worktree_path,
+    MergeError, Worktree, WorktreeError, branch_name, diff, diff_stat, discard, merge,
+    remove_worktree, worktree_path,
 };

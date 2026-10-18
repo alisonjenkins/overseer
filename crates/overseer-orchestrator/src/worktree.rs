@@ -25,6 +25,41 @@ pub enum WorktreeError {
     GitFailed { command: String, stderr: String },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    #[error("repository working tree is not clean; commit or stash changes before merging")]
+    WorkingTreeDirty,
+
+    #[error(
+        "current branch is {current:?}, but task {task_id} branched from {expected:?}; switch to {expected:?} before merging"
+    )]
+    WrongBranch {
+        task_id: TaskId,
+        current: String,
+        expected: String,
+    },
+
+    #[error("merge conflict in {}", paths.join(", "))]
+    MergeConflict { paths: Vec<String> },
+
+    #[error("failed to start `git {command}`")]
+    SpawnGit {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("`git {command}` failed: {stderr}")]
+    GitFailed { command: String, stderr: String },
+
+    #[error("failed to remove worktree {path}")]
+    RemoveWorktree {
+        path: PathBuf,
+        #[source]
+        source: WorktreeError,
+    },
+}
+
 /// A checked-out task branch in its own directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -157,6 +192,234 @@ pub async fn remove_worktree(repo: &Path, worktree: &Path) -> Result<(), Worktre
     let path_text = worktree.to_string_lossy().into_owned();
     git(repo, &["worktree", "remove", "--force", &path_text]).await?;
     Ok(())
+}
+
+/// Merge a task branch into the repository's current branch.
+///
+/// Refuses if the working tree is dirty or the current branch differs from the
+/// branch the task branched from. Runs `git merge-tree --write-tree` first and
+/// returns a `MergeConflict` error listing conflicted paths without modifying
+/// the repository. Otherwise performs a `--no-ff` merge, removes the task
+/// worktree, and deletes the branch.
+pub async fn merge(
+    repo: &Path,
+    worktree: Option<&Path>,
+    branch: &str,
+    task_id: TaskId,
+    title: &str,
+) -> Result<String, MergeError> {
+    let status =
+        git(repo, &["status", "--porcelain"])
+            .await
+            .map_err(|err| MergeError::GitFailed {
+                command: "status --porcelain".to_owned(),
+                stderr: err.to_string(),
+            })?;
+    if !status.trim().is_empty() {
+        return Err(MergeError::WorkingTreeDirty);
+    }
+
+    let current_branch = git(repo, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .map_err(|err| MergeError::GitFailed {
+            command: "symbolic-ref --short HEAD".to_owned(),
+            stderr: err.to_string(),
+        })?
+        .trim()
+        .to_owned();
+
+    if let Some(expected) = base_branch_for(repo, branch).await
+        && current_branch != expected
+    {
+        return Err(MergeError::WrongBranch {
+            task_id,
+            current: current_branch,
+            expected,
+        });
+    }
+
+    let command_name = format!("merge-tree --write-tree HEAD {branch}");
+    let merge_tree_output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-tree", "--write-tree", "HEAD", branch])
+        .output()
+        .await
+        .map_err(|source| MergeError::SpawnGit {
+            command: command_name,
+            source,
+        })?;
+    if !merge_tree_output.status.success() {
+        let stdout = String::from_utf8_lossy(&merge_tree_output.stdout);
+        let paths = parse_merge_conflicts(&stdout);
+        return Err(MergeError::MergeConflict { paths });
+    }
+
+    let message = format!("overseer: merge task {task_id}: {title}");
+    git(repo, &["merge", "--no-ff", "-m", &message, branch])
+        .await
+        .map_err(|err| MergeError::GitFailed {
+            command: format!("merge --no-ff -m <message> {branch}"),
+            stderr: err.to_string(),
+        })?;
+
+    let sha = git(repo, &["rev-parse", "HEAD"])
+        .await
+        .map_err(|err| MergeError::GitFailed {
+            command: "rev-parse HEAD".to_owned(),
+            stderr: err.to_string(),
+        })?
+        .trim()
+        .to_owned();
+
+    let target_wt = match worktree {
+        Some(path) if path.exists() => Some(path.to_path_buf()),
+        _ => find_worktree_for_branch(repo, branch).await,
+    };
+    if let Some(path) = target_wt
+        && path.exists()
+    {
+        remove_worktree(repo, &path)
+            .await
+            .map_err(|source| MergeError::RemoveWorktree {
+                path: path.clone(),
+                source,
+            })?;
+    }
+
+    git(repo, &["branch", "-d", branch])
+        .await
+        .map_err(|err| MergeError::GitFailed {
+            command: format!("branch -d {branch}"),
+            stderr: err.to_string(),
+        })?;
+
+    Ok(sha)
+}
+
+/// Remove a task worktree (if present) and force-delete the task branch.
+pub async fn discard(
+    repo: &Path,
+    worktree: Option<&Path>,
+    branch: &str,
+) -> Result<(), WorktreeError> {
+    let target_wt = match worktree {
+        Some(path) if path.exists() => Some(path.to_path_buf()),
+        _ => find_worktree_for_branch(repo, branch).await,
+    };
+    if let Some(path) = target_wt
+        && path.exists()
+    {
+        remove_worktree(repo, &path).await?;
+    }
+    git(repo, &["branch", "-D", branch]).await?;
+    Ok(())
+}
+
+async fn base_branch_for(repo: &Path, branch: &str) -> Option<String> {
+    if let Ok(val) = git(
+        repo,
+        &["config", "--get", &format!("branch.{branch}.overseer-base")],
+    )
+    .await
+    {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+
+    if let Ok(reflog) = git(repo, &["reflog", "show", "--format=%gs", branch]).await {
+        for line in reflog.lines() {
+            if let Some(rest) = line.strip_prefix("branch: Created from ") {
+                let trimmed = rest.trim();
+                if !trimmed.is_empty() && trimmed != "HEAD" {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .await
+    {
+        let branches: Vec<&str> = output
+            .lines()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && !b.starts_with("overseer/"))
+            .collect();
+        if branches.len() == 1
+            && let Some(b) = branches.first()
+        {
+            return Some((*b).to_owned());
+        }
+
+        let mut best_branch = None;
+        let mut best_time = i64::MIN;
+        for b in branches {
+            if let Ok(mb) = git(repo, &["merge-base", b, branch]).await {
+                let mb = mb.trim();
+                if !mb.is_empty()
+                    && let Ok(t_str) = git(repo, &["log", "-1", "--format=%ct", mb]).await
+                    && let Ok(t) = t_str.trim().parse::<i64>()
+                    && t > best_time
+                {
+                    best_time = t;
+                    best_branch = Some(b.to_owned());
+                }
+            }
+        }
+        if best_branch.is_some() {
+            return best_branch;
+        }
+    }
+
+    None
+}
+
+fn parse_merge_conflicts(output: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if let Some((_, path)) = line.split_once('\t') {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && !paths.contains(&trimmed.to_owned()) {
+                paths.push(trimmed.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("CONFLICT (")
+            && let Some((_, msg)) = rest.split_once(':')
+        {
+            let msg = msg.trim();
+            let path = if let Some(p) = msg.strip_prefix("Merge conflict in ") {
+                p.trim()
+            } else {
+                msg.split_whitespace().next().unwrap_or("").trim()
+            };
+            if !path.is_empty() && !paths.contains(&path.to_owned()) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+async fn find_worktree_for_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
+    let output = git(repo, &["worktree", "list", "--porcelain"]).await.ok()?;
+    let target_ref = format!("refs/heads/{branch}");
+    let mut current_wt: Option<PathBuf> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_wt = Some(PathBuf::from(path.trim()));
+        } else if let Some(b) = line.strip_prefix("branch ")
+            && b.trim() == target_ref
+        {
+            return current_wt;
+        }
+    }
+    None
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
@@ -372,5 +635,166 @@ mod tests {
 
         let stat = diff_stat(&repo, &worktree.branch).await.unwrap();
         assert!(stat.trim().is_empty(), "{stat}");
+    }
+
+    #[tokio::test]
+    async fn merge_successful_merges_with_no_ff_and_cleans_up() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(1)).await.unwrap();
+
+        std::fs::write(worktree.path.join("feature.txt"), "feature output\n").unwrap();
+        commit_all(&worktree.path, "task 1 commit").await.unwrap();
+
+        let sha = merge(
+            &repo,
+            Some(&worktree.path),
+            &worktree.branch,
+            TaskId::new(1),
+            "implement feature",
+        )
+        .await
+        .unwrap();
+
+        let head = git_sync(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(sha, head.trim());
+
+        let subject = git_sync(&repo, &["log", "-1", "--format=%s"]);
+        assert_eq!(subject.trim(), "overseer: merge task 1: implement feature");
+
+        let parent2 = git_sync(&repo, &["rev-parse", "HEAD^2"]);
+        assert!(!parent2.trim().is_empty());
+
+        assert!(!worktree.path.exists());
+        let branches = git_sync(&repo, &["branch", "--list", "overseer/task-1"]);
+        assert!(branches.trim().is_empty(), "{branches}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("feature.txt")).unwrap(),
+            "feature output\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_when_working_tree_is_dirty() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(2)).await.unwrap();
+
+        std::fs::write(worktree.path.join("file.txt"), "task 2\n").unwrap();
+        commit_all(&worktree.path, "task 2 commit").await.unwrap();
+
+        std::fs::write(repo.join("dirty.txt"), "uncommitted\n").unwrap();
+
+        let err = merge(
+            &repo,
+            Some(&worktree.path),
+            &worktree.branch,
+            TaskId::new(2),
+            "title",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, MergeError::WorkingTreeDirty), "{err:?}");
+        assert!(!repo.join("file.txt").exists());
+        assert!(worktree.path.exists());
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_when_on_wrong_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(3)).await.unwrap();
+
+        git_sync(&repo, &["checkout", "-b", "other"]);
+
+        let err = merge(
+            &repo,
+            Some(&worktree.path),
+            &worktree.branch,
+            TaskId::new(3),
+            "title",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                MergeError::WrongBranch {
+                    task_id,
+                    current,
+                    expected,
+                } if *task_id == TaskId::new(3) && current == "other" && expected == "main"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_when_merge_conflict_and_leaves_tree_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(4)).await.unwrap();
+
+        std::fs::write(worktree.path.join("README.md"), "task version\n").unwrap();
+        commit_all(&worktree.path, "task 4 commit").await.unwrap();
+
+        std::fs::write(repo.join("README.md"), "main version\n").unwrap();
+        git_sync(&repo, &["commit", "-am", "main version commit"]);
+
+        let err = merge(
+            &repo,
+            Some(&worktree.path),
+            &worktree.branch,
+            TaskId::new(4),
+            "title",
+        )
+        .await
+        .unwrap_err();
+
+        let paths = match err {
+            MergeError::MergeConflict { paths } => paths,
+            _ => Vec::new(),
+        };
+        assert!(paths.contains(&"README.md".to_owned()), "{paths:?}");
+
+        let status = git_sync(&repo, &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "{status}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "main version\n"
+        );
+        assert!(worktree.path.exists());
+    }
+
+    #[tokio::test]
+    async fn discard_removes_worktree_and_deletes_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let worktree = create(&repo, &state, TaskId::new(5)).await.unwrap();
+
+        discard(&repo, Some(&worktree.path), &worktree.branch)
+            .await
+            .unwrap();
+
+        assert!(!worktree.path.exists());
+        let branches = git_sync(&repo, &["branch", "--list", "overseer/task-5"]);
+        assert!(branches.trim().is_empty(), "{branches}");
     }
 }
