@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use overseer_core::{NewTask, Run, RunFinish, RunId, RunStatus, Task, TaskId, TaskStatus, Usage};
+use overseer_core::{
+    NewReview, NewTask, ReviewRecord, Run, RunFinish, RunId, RunStatus, Task, TaskId, TaskStatus,
+    Usage, Verdict,
+};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use time::OffsetDateTime;
@@ -12,6 +15,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_runs.sql")),
     (3, include_str!("../migrations/0003_settings.sql")),
+    (4, include_str!("../migrations/0004_reviews.sql")),
 ];
 
 /// Settings key holding the `credits_low` mode flag, stored as `"true"` or
@@ -19,7 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
 const CREDITS_LOW_KEY: &str = "credits_low";
 
 const SELECT_TASK: &str =
-    "SELECT id, title, body, status, priority, profile, round, created_at FROM tasks";
+    "SELECT id, title, body, status, priority, profile, round, approved, created_at FROM tasks";
 
 const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
      input_tokens, output_tokens, failure, transcript_path, branch FROM runs";
@@ -133,6 +137,7 @@ impl Store {
             priority,
             profile,
             round: 0,
+            approved: false,
             depends_on,
             created_at,
         })
@@ -408,6 +413,126 @@ impl Store {
     pub fn set_credits_low(&mut self, on: bool) -> Result<(), StoreError> {
         self.set_setting(CREDITS_LOW_KEY, if on { "true" } else { "false" })
     }
+
+    pub fn record_review(&mut self, new: NewReview) -> Result<ReviewRecord, StoreError> {
+        let NewReview {
+            task_id,
+            round,
+            profile,
+            verdict,
+            path,
+        } = new;
+        let created_at = now_rfc3339()?;
+        let path_str = path.to_string_lossy().into_owned();
+
+        self.conn
+            .execute(
+                "INSERT INTO reviews (task_id, round, profile, verdict, path, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task_id.get(),
+                    round,
+                    profile,
+                    verdict.as_str(),
+                    path_str,
+                    created_at,
+                ],
+            )
+            .map_err(|source| StoreError::InsertReview { task_id, source })?;
+
+        let id = self.conn.last_insert_rowid();
+
+        Ok(ReviewRecord {
+            id,
+            task_id,
+            round,
+            profile,
+            verdict,
+            path,
+            created_at,
+        })
+    }
+
+    pub fn list_reviews(&self, task_id: TaskId) -> Result<Vec<ReviewRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, task_id, round, profile, verdict, path, created_at \
+                 FROM reviews WHERE task_id = ?1 ORDER BY round ASC, id ASC",
+            )
+            .map_err(|source| StoreError::ListReviews { task_id, source })?;
+
+        let rows = stmt
+            .query_map(params![task_id.get()], review_from_row)
+            .map_err(|source| StoreError::ListReviews { task_id, source })?;
+
+        let mut reviews = Vec::new();
+        for row in rows {
+            let review = row.map_err(|source| StoreError::ListReviews { task_id, source })?;
+            reviews.push(review);
+        }
+        Ok(reviews)
+    }
+
+    pub fn list_reviews_for_round(
+        &self,
+        task_id: TaskId,
+        round: u8,
+    ) -> Result<Vec<ReviewRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, task_id, round, profile, verdict, path, created_at \
+                 FROM reviews WHERE task_id = ?1 AND round = ?2 ORDER BY id ASC",
+            )
+            .map_err(|source| StoreError::ListReviews { task_id, source })?;
+
+        let rows = stmt
+            .query_map(params![task_id.get(), round], review_from_row)
+            .map_err(|source| StoreError::ListReviews { task_id, source })?;
+
+        let mut reviews = Vec::new();
+        for row in rows {
+            let review = row.map_err(|source| StoreError::ListReviews { task_id, source })?;
+            reviews.push(review);
+        }
+        Ok(reviews)
+    }
+
+    pub fn set_approved(&mut self, id: TaskId, approved: bool) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET approved = ?1 WHERE id = ?2",
+                params![approved, id.get()],
+            )
+            .map_err(|source| StoreError::SetApproved {
+                task_id: id,
+                source,
+            })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownTask { id });
+        }
+        Ok(())
+    }
+
+    pub fn increment_round(&mut self, id: TaskId) -> Result<u8, StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET round = round + 1 WHERE id = ?1",
+                params![id.get()],
+            )
+            .map_err(|source| StoreError::IncrementRound {
+                task_id: id,
+                source,
+            })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownTask { id });
+        }
+        let task = self.get_task(id)?;
+        Ok(task.round)
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -448,6 +573,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     let status = status_text
         .parse::<TaskStatus>()
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(err)))?;
+    let approved: bool = row.get(7)?;
     Ok(Task {
         id: TaskId::new(row.get(0)?),
         title: row.get(1)?,
@@ -456,8 +582,9 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         priority: row.get(4)?,
         profile: row.get(5)?,
         round: row.get(6)?,
+        approved,
         depends_on: Vec::new(),
-        created_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -494,6 +621,23 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
     })
 }
 
+fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ReviewRecord> {
+    let verdict_text: String = row.get(4)?;
+    let verdict = verdict_text
+        .parse::<Verdict>()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(err)))?;
+    let path_text: String = row.get(5)?;
+    Ok(ReviewRecord {
+        id: row.get(0)?,
+        task_id: TaskId::new(row.get(1)?),
+        round: row.get(2)?,
+        profile: row.get(3)?,
+        verdict,
+        path: PathBuf::from(path_text),
+        created_at: row.get(6)?,
+    })
+}
+
 fn load_deps(conn: &Connection, id: TaskId) -> rusqlite::Result<Vec<TaskId>> {
     let mut stmt =
         conn.prepare("SELECT depends_on FROM task_deps WHERE task_id = ?1 ORDER BY depends_on")?;
@@ -509,7 +653,9 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use overseer_core::{NewTask, RunFinish, RunId, RunStatus, TaskId, TaskStatus, Usage};
+    use overseer_core::{
+        NewReview, NewTask, RunFinish, RunId, RunStatus, TaskId, TaskStatus, Usage, Verdict,
+    };
 
     use super::Store;
     use crate::StoreError;
@@ -1157,5 +1303,138 @@ mod tests {
         assert_eq!(all[0].id, r3);
         assert_eq!(all[1].id, r2);
         assert_eq!(all[2].id, r1);
+    }
+
+    #[test]
+    fn record_and_list_reviews() {
+        let mut store = memory_store();
+        let t = store.add_task(new_task("t", 0)).unwrap();
+
+        let r1 = store
+            .record_review(NewReview {
+                task_id: t.id,
+                round: 0,
+                profile: "gemini".to_owned(),
+                verdict: Verdict::Changes,
+                path: PathBuf::from("/state/reviews/task-1/round-0/gemini.md"),
+            })
+            .unwrap();
+
+        let r2 = store
+            .record_review(NewReview {
+                task_id: t.id,
+                round: 0,
+                profile: "local".to_owned(),
+                verdict: Verdict::Pass,
+                path: PathBuf::from("/state/reviews/task-1/round-0/local.md"),
+            })
+            .unwrap();
+
+        let r3 = store
+            .record_review(NewReview {
+                task_id: t.id,
+                round: 1,
+                profile: "gemini".to_owned(),
+                verdict: Verdict::Pass,
+                path: PathBuf::from("/state/reviews/task-1/round-1/gemini.md"),
+            })
+            .unwrap();
+
+        let reviews = store.list_reviews(t.id).unwrap();
+        assert_eq!(reviews.len(), 3);
+        assert_eq!(reviews[0].id, r1.id);
+        assert_eq!(reviews[0].round, 0);
+        assert_eq!(reviews[0].profile, "gemini");
+        assert_eq!(reviews[0].verdict, Verdict::Changes);
+
+        assert_eq!(reviews[1].id, r2.id);
+        assert_eq!(reviews[1].round, 0);
+        assert_eq!(reviews[1].profile, "local");
+        assert_eq!(reviews[1].verdict, Verdict::Pass);
+
+        assert_eq!(reviews[2].id, r3.id);
+        assert_eq!(reviews[2].round, 1);
+        assert_eq!(reviews[2].profile, "gemini");
+        assert_eq!(reviews[2].verdict, Verdict::Pass);
+
+        // Filter by round
+        let round_0 = store.list_reviews_for_round(t.id, 0).unwrap();
+        assert_eq!(round_0.len(), 2);
+        assert_eq!(round_0[0].profile, "gemini");
+        assert_eq!(round_0[1].profile, "local");
+
+        let round_1 = store.list_reviews_for_round(t.id, 1).unwrap();
+        assert_eq!(round_1.len(), 1);
+        assert_eq!(round_1[0].profile, "gemini");
+
+        let round_2 = store.list_reviews_for_round(t.id, 2).unwrap();
+        assert!(round_2.is_empty());
+    }
+
+    #[test]
+    fn set_approved_and_increment_round() {
+        let mut store = memory_store();
+        let t = store.add_task(new_task("t", 0)).unwrap();
+
+        assert!(!t.approved);
+        assert_eq!(t.round, 0);
+
+        store.set_approved(t.id, true).unwrap();
+        let loaded = store.get_task(t.id).unwrap();
+        assert!(loaded.approved);
+
+        let new_round = store.increment_round(t.id).unwrap();
+        assert_eq!(new_round, 1);
+        let loaded = store.get_task(t.id).unwrap();
+        assert_eq!(loaded.round, 1);
+
+        let new_round = store.increment_round(t.id).unwrap();
+        assert_eq!(new_round, 2);
+        let loaded = store.get_task(t.id).unwrap();
+        assert_eq!(loaded.round, 2);
+
+        // Unknown task returns error
+        assert!(matches!(
+            store.set_approved(TaskId::new(999), true).unwrap_err(),
+            StoreError::UnknownTask { .. }
+        ));
+        assert!(matches!(
+            store.increment_round(TaskId::new(999)).unwrap_err(),
+            StoreError::UnknownTask { .. }
+        ));
+    }
+
+    #[test]
+    fn reviews_and_approval_persist_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("overseer.db");
+
+        let task_id = {
+            let mut store = Store::open(&db_path).unwrap();
+            let t = store.add_task(new_task("persist test", 1)).unwrap();
+            store.set_approved(t.id, true).unwrap();
+            store.increment_round(t.id).unwrap();
+            store
+                .record_review(NewReview {
+                    task_id: t.id,
+                    round: 0,
+                    profile: "local".to_owned(),
+                    verdict: Verdict::Pass,
+                    path: PathBuf::from("/path/to/review.md"),
+                })
+                .unwrap();
+            t.id
+        };
+
+        let reopened = Store::open(&db_path).unwrap();
+        let task = reopened.get_task(task_id).unwrap();
+        assert!(task.approved);
+        assert_eq!(task.round, 1);
+
+        let reviews = reopened.list_reviews(task_id).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].profile, "local");
+        assert_eq!(reviews[0].verdict, Verdict::Pass);
+        assert_eq!(reviews[0].path, PathBuf::from("/path/to/review.md"));
     }
 }

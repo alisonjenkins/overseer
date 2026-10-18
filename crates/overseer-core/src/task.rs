@@ -40,6 +40,7 @@ pub struct Task {
     pub priority: i32,
     pub profile: Option<String>,
     pub round: u8,
+    pub approved: bool,
     pub depends_on: Vec<TaskId>,
     /// ISO8601 UTC, e.g. `2026-10-18T08:00:00Z`.
     pub created_at: String,

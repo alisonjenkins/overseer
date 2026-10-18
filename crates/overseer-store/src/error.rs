@@ -155,4 +155,32 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("failed to insert review for task {task_id}")]
+    InsertReview {
+        task_id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to list reviews for task {task_id}")]
+    ListReviews {
+        task_id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to set approval on task {task_id}")]
+    SetApproved {
+        task_id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to increment round on task {task_id}")]
+    IncrementRound {
+        task_id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
 }

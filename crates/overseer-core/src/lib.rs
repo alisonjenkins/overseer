@@ -9,7 +9,9 @@ mod task;
 
 pub use config::{BackendKind, Config, Profile, ReviewConfig};
 pub use permissions::Permissions;
-pub use review::{ParsedReview, ReviewParseError, Verdict, parse_review, parse_verdict};
+pub use review::{
+    NewReview, ParsedReview, ReviewParseError, ReviewRecord, Verdict, parse_review, parse_verdict,
+};
 pub use run::{FailureKind, Run, RunFinish, RunId, RunOutcome, RunRequest, RunStatus, Usage};
 pub use status::TaskStatus;
 pub use task::{NewTask, Task, TaskId};

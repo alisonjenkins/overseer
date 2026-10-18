@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use crate::CoreError;
+use crate::{CoreError, TaskId};
 
 /// The verdict returned by an automated reviewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56,6 +58,29 @@ pub enum ReviewParseError {
 pub struct ParsedReview {
     pub verdict: Verdict,
     pub feedback: String,
+}
+
+/// Input for recording a review in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewReview {
+    pub task_id: TaskId,
+    pub round: u8,
+    pub profile: String,
+    pub verdict: Verdict,
+    pub path: PathBuf,
+}
+
+/// A stored review record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub id: i64,
+    pub task_id: TaskId,
+    pub round: u8,
+    pub profile: String,
+    pub verdict: Verdict,
+    pub path: PathBuf,
+    /// ISO8601 UTC timestamp.
+    pub created_at: String,
 }
 
 /// Parse a reviewer's output. The FIRST non-empty line must be exactly
