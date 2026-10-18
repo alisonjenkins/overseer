@@ -4,6 +4,7 @@ description = "Task execution: worktrees, runs and task status transitions"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
