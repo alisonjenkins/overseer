@@ -228,7 +228,7 @@ fn classify_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Failu
     ))
 }
 
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     expand_tilde_with(path, std::env::var("HOME").ok().as_deref())
 }
 

@@ -7,6 +7,7 @@
 
 mod command;
 mod error;
+pub mod health;
 mod mock;
 mod openai;
 pub mod tools;
@@ -16,6 +17,7 @@ use overseer_core::{BackendKind, FailureKind, Profile, RunOutcome, RunRequest};
 
 pub use command::CommandBackend;
 pub use error::BackendError;
+pub use health::{Health, check_profile};
 pub use mock::MockBackend;
 pub use openai::OpenAiBackend;
 
