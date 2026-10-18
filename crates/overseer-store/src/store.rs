@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use overseer_core::{
-    NewReview, NewTask, ReviewRecord, Run, RunFinish, RunId, RunStatus, Task, TaskId, TaskStatus,
-    Usage, Verdict,
+    Lesson, LessonId, LessonStatus, NewLesson, NewReview, NewTask, ReviewRecord, Run, RunFinish,
+    RunId, RunStatus, Task, TaskId, TaskStatus, Usage, Verdict,
 };
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -16,6 +16,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/0002_runs.sql")),
     (3, include_str!("../migrations/0003_settings.sql")),
     (4, include_str!("../migrations/0004_reviews.sql")),
+    (5, include_str!("../migrations/0005_lessons.sql")),
 ];
 
 /// Settings key holding the `credits_low` mode flag, stored as `"true"` or
@@ -26,7 +27,10 @@ const SELECT_TASK: &str =
     "SELECT id, title, body, status, priority, profile, round, approved, created_at FROM tasks";
 
 const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
-     input_tokens, output_tokens, failure, transcript_path, branch FROM runs";
+     input_tokens, output_tokens, failure, transcript_path, branch, skills FROM runs";
+
+const SELECT_LESSON: &str =
+    "SELECT id, task_id, skill, base_version, status, path, created_at FROM lessons";
 
 fn now_rfc3339() -> Result<String, StoreError> {
     OffsetDateTime::now_utc()
@@ -299,13 +303,18 @@ impl Store {
     }
 
     /// Record the start of an attempt at `task_id` on `profile`.
-    pub fn start_run(&mut self, task_id: TaskId, profile: &str) -> Result<RunId, StoreError> {
+    pub fn start_run(
+        &mut self,
+        task_id: TaskId,
+        profile: &str,
+        skills: Option<&str>,
+    ) -> Result<RunId, StoreError> {
         let started_at = now_rfc3339()?;
         self.conn
             .execute(
-                "INSERT INTO runs (task_id, profile, started_at, status) \
-                 VALUES (?1, ?2, ?3, 'running')",
-                params![task_id.get(), profile, started_at],
+                "INSERT INTO runs (task_id, profile, started_at, status, skills) \
+                 VALUES (?1, ?2, ?3, 'running', ?4)",
+                params![task_id.get(), profile, started_at, skills],
             )
             .map_err(|source| StoreError::InsertRun { task_id, source })?;
         Ok(RunId::new(self.conn.last_insert_rowid()))
@@ -533,6 +542,98 @@ impl Store {
         let task = self.get_task(id)?;
         Ok(task.round)
     }
+
+    pub fn add_lesson(&mut self, new: NewLesson) -> Result<Lesson, StoreError> {
+        let created_at = now_rfc3339()?;
+        let status = LessonStatus::Proposed;
+        let path_str = new.path.to_string_lossy().into_owned();
+        self.conn
+            .execute(
+                "INSERT INTO lessons (task_id, skill, base_version, status, path, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new.task_id.get(),
+                    new.skill,
+                    new.base_version,
+                    status.as_str(),
+                    path_str,
+                    created_at,
+                ],
+            )
+            .map_err(|source| StoreError::InsertLesson {
+                task_id: new.task_id,
+                source,
+            })?;
+        let id = LessonId::new(self.conn.last_insert_rowid());
+        Ok(Lesson {
+            id,
+            task_id: new.task_id,
+            skill: new.skill,
+            base_version: new.base_version,
+            status,
+            path: new.path,
+            created_at,
+        })
+    }
+
+    pub fn get_lesson(&self, id: LessonId) -> Result<Lesson, StoreError> {
+        self.conn
+            .query_row(
+                &format!("{SELECT_LESSON} WHERE id = ?1"),
+                params![id.get()],
+                lesson_from_row,
+            )
+            .optional()
+            .map_err(|source| StoreError::LoadLesson { id, source })?
+            .ok_or(StoreError::UnknownLesson { id })
+    }
+
+    pub fn list_lessons(&self, status: Option<LessonStatus>) -> Result<Vec<Lesson>, StoreError> {
+        let list_err = |source| StoreError::ListLessons { source };
+        let mut lessons = Vec::new();
+        if let Some(status) = status {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "{SELECT_LESSON} WHERE status = ?1 ORDER BY id ASC"
+                ))
+                .map_err(list_err)?;
+            let rows = stmt
+                .query_map(params![status.as_str()], lesson_from_row)
+                .map_err(list_err)?;
+            for row in rows {
+                lessons.push(row.map_err(list_err)?);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(&format!("{SELECT_LESSON} ORDER BY id ASC"))
+                .map_err(list_err)?;
+            let rows = stmt.query_map([], lesson_from_row).map_err(list_err)?;
+            for row in rows {
+                lessons.push(row.map_err(list_err)?);
+            }
+        }
+        Ok(lessons)
+    }
+
+    pub fn set_lesson_status(
+        &mut self,
+        id: LessonId,
+        status: LessonStatus,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE lessons SET status = ?1 WHERE id = ?2",
+                params![status.as_str(), id.get()],
+            )
+            .map_err(|source| StoreError::SetLessonStatus { id, source })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownLesson { id });
+        }
+        Ok(())
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -618,6 +719,32 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
         failure: row.get(8)?,
         transcript_path: transcript.map(PathBuf::from),
         branch: row.get(10)?,
+        skills: row.get(11)?,
+    })
+}
+
+fn lesson_from_row(row: &Row<'_>) -> rusqlite::Result<Lesson> {
+    let status_text: String = row.get(4)?;
+    let status = LessonStatus::from_db_text(&status_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            Type::Text,
+            format!("unknown lesson status {status_text:?}").into(),
+        )
+    })?;
+    let path_str: String = row.get(5)?;
+    let base_version_raw: i64 = row.get(3)?;
+    let base_version = u32::try_from(base_version_raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(err))
+    })?;
+    Ok(Lesson {
+        id: LessonId::new(row.get(0)?),
+        task_id: TaskId::new(row.get(1)?),
+        skill: row.get(2)?,
+        base_version,
+        status,
+        path: PathBuf::from(path_str),
+        created_at: row.get(6)?,
     })
 }
 
@@ -654,7 +781,8 @@ mod tests {
     use std::path::PathBuf;
 
     use overseer_core::{
-        NewReview, NewTask, RunFinish, RunId, RunStatus, TaskId, TaskStatus, Usage, Verdict,
+        LessonId, LessonStatus, NewLesson, NewReview, NewTask, RunFinish, RunId, RunStatus, TaskId,
+        TaskStatus, Usage, Verdict,
     };
 
     use super::Store;
@@ -956,7 +1084,7 @@ mod tests {
     fn start_run_records_a_running_row() {
         let mut store = memory_store();
         let task = store.add_task(new_task("a", 0)).unwrap();
-        let run = store.start_run(task.id, "local").unwrap();
+        let run = store.start_run(task.id, "local", None).unwrap();
 
         let runs = store.list_runs(task.id).unwrap();
         assert_eq!(runs.len(), 1);
@@ -971,13 +1099,14 @@ mod tests {
         assert_eq!(row.failure, None);
         assert_eq!(row.transcript_path, None);
         assert_eq!(row.branch, None);
+        assert_eq!(row.skills, None);
     }
 
     #[test]
     fn finish_run_records_usage_transcript_and_branch() {
         let mut store = memory_store();
         let task = store.add_task(new_task("a", 0)).unwrap();
-        let run = store.start_run(task.id, "local").unwrap();
+        let run = store.start_run(task.id, "local", None).unwrap();
         store
             .finish_run(run, finished(RunStatus::Succeeded))
             .unwrap();
@@ -1000,7 +1129,7 @@ mod tests {
     fn finish_run_records_failure_text() {
         let mut store = memory_store();
         let task = store.add_task(new_task("a", 0)).unwrap();
-        let run = store.start_run(task.id, "local").unwrap();
+        let run = store.start_run(task.id, "local", None).unwrap();
         let failure = RunFinish {
             failure: Some("unreachable".to_owned()),
             ..finished(RunStatus::Failed)
@@ -1016,7 +1145,7 @@ mod tests {
     fn finishing_as_running_or_unknown_run_is_rejected() {
         let mut store = memory_store();
         let task = store.add_task(new_task("a", 0)).unwrap();
-        let run = store.start_run(task.id, "local").unwrap();
+        let run = store.start_run(task.id, "local", None).unwrap();
 
         let err = store
             .finish_run(run, finished(RunStatus::Running))
@@ -1040,9 +1169,9 @@ mod tests {
         let mut store = memory_store();
         let first = store.add_task(new_task("first", 0)).unwrap();
         let second = store.add_task(new_task("second", 0)).unwrap();
-        let r1 = store.start_run(first.id, "local").unwrap();
-        store.start_run(second.id, "local").unwrap();
-        let r2 = store.start_run(first.id, "agy").unwrap();
+        let r1 = store.start_run(first.id, "local", None).unwrap();
+        store.start_run(second.id, "local", None).unwrap();
+        let r2 = store.start_run(first.id, "agy", None).unwrap();
 
         let ids: Vec<RunId> = store
             .list_runs(first.id)
@@ -1061,7 +1190,7 @@ mod tests {
         let task_id = {
             let mut store = Store::open(&path).unwrap();
             let task = store.add_task(new_task("kept", 0)).unwrap();
-            let run = store.start_run(task.id, "local").unwrap();
+            let run = store.start_run(task.id, "local", None).unwrap();
             store
                 .finish_run(run, finished(RunStatus::Succeeded))
                 .unwrap();
@@ -1289,9 +1418,9 @@ mod tests {
     fn list_recent_runs_orders_newest_first_and_limits() {
         let mut store = memory_store();
         let t = store.add_task(new_task("t", 0)).unwrap();
-        let r1 = store.start_run(t.id, "local").unwrap();
-        let r2 = store.start_run(t.id, "local").unwrap();
-        let r3 = store.start_run(t.id, "local").unwrap();
+        let r1 = store.start_run(t.id, "local", None).unwrap();
+        let r2 = store.start_run(t.id, "local", None).unwrap();
+        let r3 = store.start_run(t.id, "local", None).unwrap();
 
         let recent = store.list_recent_runs(2).unwrap();
         assert_eq!(recent.len(), 2);
@@ -1436,5 +1565,157 @@ mod tests {
         assert_eq!(reviews[0].profile, "local");
         assert_eq!(reviews[0].verdict, Verdict::Pass);
         assert_eq!(reviews[0].path, PathBuf::from("/path/to/review.md"));
+    }
+
+    #[test]
+    fn start_run_records_skills_column() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let run = store
+            .start_run(task.id, "local", Some("rust:v1,testing:v2"))
+            .unwrap();
+        let row = store.list_runs(task.id).unwrap().remove(0);
+        assert_eq!(row.id, run);
+        assert_eq!(row.skills.as_deref(), Some("rust:v1,testing:v2"));
+    }
+
+    #[test]
+    fn add_lesson_assigns_id_and_sets_proposed() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let lesson = store
+            .add_lesson(NewLesson {
+                task_id: task.id,
+                skill: "rust".to_owned(),
+                base_version: 1,
+                path: PathBuf::from("/state/lessons/1.md"),
+            })
+            .unwrap();
+
+        assert_eq!(lesson.id, LessonId::new(1));
+        assert_eq!(lesson.task_id, task.id);
+        assert_eq!(lesson.skill, "rust");
+        assert_eq!(lesson.base_version, 1);
+        assert_eq!(lesson.status, LessonStatus::Proposed);
+        assert_eq!(lesson.path, PathBuf::from("/state/lessons/1.md"));
+        assert!(lesson.created_at.ends_with('Z'));
+    }
+
+    #[test]
+    fn get_lesson_returns_stored_lesson() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let added = store
+            .add_lesson(NewLesson {
+                task_id: task.id,
+                skill: "testing".to_owned(),
+                base_version: 2,
+                path: PathBuf::from("/state/lessons/2.md"),
+            })
+            .unwrap();
+
+        let fetched = store.get_lesson(added.id).unwrap();
+        assert_eq!(fetched, added);
+    }
+
+    #[test]
+    fn get_unknown_lesson_is_an_error() {
+        let store = memory_store();
+        let err = store.get_lesson(LessonId::new(999)).unwrap_err();
+        assert!(matches!(err, StoreError::UnknownLesson { id } if id == LessonId::new(999)));
+    }
+
+    #[test]
+    fn list_lessons_filters_by_status() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let l1 = store
+            .add_lesson(NewLesson {
+                task_id: task.id,
+                skill: "rust".to_owned(),
+                base_version: 1,
+                path: PathBuf::from("/state/lessons/1.md"),
+            })
+            .unwrap();
+        let l2 = store
+            .add_lesson(NewLesson {
+                task_id: task.id,
+                skill: "testing".to_owned(),
+                base_version: 1,
+                path: PathBuf::from("/state/lessons/2.md"),
+            })
+            .unwrap();
+
+        store
+            .set_lesson_status(l1.id, LessonStatus::Applied)
+            .unwrap();
+
+        let all = store.list_lessons(None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, l1.id);
+        assert_eq!(all[1].id, l2.id);
+
+        let applied = store.list_lessons(Some(LessonStatus::Applied)).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].id, l1.id);
+
+        let proposed = store.list_lessons(Some(LessonStatus::Proposed)).unwrap();
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].id, l2.id);
+
+        let rejected = store.list_lessons(Some(LessonStatus::Rejected)).unwrap();
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn set_lesson_status_updates_row_and_rejects_unknown() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("a", 0)).unwrap();
+        let l = store
+            .add_lesson(NewLesson {
+                task_id: task.id,
+                skill: "rust".to_owned(),
+                base_version: 1,
+                path: PathBuf::from("/state/lessons/1.md"),
+            })
+            .unwrap();
+
+        store
+            .set_lesson_status(l.id, LessonStatus::Rejected)
+            .unwrap();
+        assert_eq!(
+            store.get_lesson(l.id).unwrap().status,
+            LessonStatus::Rejected
+        );
+
+        let err = store
+            .set_lesson_status(LessonId::new(999), LessonStatus::Applied)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnknownLesson { id } if id == LessonId::new(999)));
+    }
+
+    #[test]
+    fn lessons_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overseer.db");
+        let lesson_id = {
+            let mut store = Store::open(&path).unwrap();
+            let task = store.add_task(new_task("kept", 0)).unwrap();
+            let l = store
+                .add_lesson(NewLesson {
+                    task_id: task.id,
+                    skill: "rust".to_owned(),
+                    base_version: 3,
+                    path: PathBuf::from("/state/lessons/1.md"),
+                })
+                .unwrap();
+            l.id
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let l = reopened.get_lesson(lesson_id).unwrap();
+        assert_eq!(l.skill, "rust");
+        assert_eq!(l.base_version, 3);
+        assert_eq!(l.status, LessonStatus::Proposed);
     }
 }

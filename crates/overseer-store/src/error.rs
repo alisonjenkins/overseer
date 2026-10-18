@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use overseer_core::{RunId, TaskId, TaskStatus};
+use overseer_core::{LessonId, RunId, TaskId, TaskStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -183,4 +183,54 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("failed to insert lesson for task {task_id}")]
+    InsertLesson {
+        task_id: TaskId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to load lesson {id}")]
+    LoadLesson {
+        id: LessonId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("no lesson with id {id}")]
+    UnknownLesson { id: LessonId },
+
+    #[error("failed to list lessons")]
+    ListLessons {
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("failed to update status of lesson {id}")]
+    SetLessonStatus {
+        id: LessonId,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("no skill named {name:?}")]
+    SkillNotFound { name: String },
+
+    #[error("skill {name:?} has no version {version}")]
+    SkillVersionNotFound { name: String, version: u32 },
+
+    #[error("failed to parse version file at {path}")]
+    InvalidSkillVersionFile { path: PathBuf },
+
+    #[error("skill I/O failed while {action} on {path}")]
+    SkillIo {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("invalid skill name {name:?}; must match [a-z0-9-]+")]
+    InvalidSkillName { name: String },
 }

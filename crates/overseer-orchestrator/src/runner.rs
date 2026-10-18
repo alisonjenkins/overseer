@@ -386,7 +386,7 @@ async fn execute(
             continue;
         }
         let run_id = store
-            .start_run(task_id, &profile.name)
+            .start_run(task_id, &profile.name, None)
             .map_err(store_step("start run"))?;
 
         let mut attempt = match &worktree {

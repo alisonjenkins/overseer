@@ -123,7 +123,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let task = store.add_task(new_task("interrupted task")).unwrap();
         store.claim_task(task.id).unwrap();
-        let run_id = store.start_run(task.id, "local").unwrap();
+        let run_id = store.start_run(task.id, "local", None).unwrap();
 
         let recovered = recover_interrupted(&mut store).unwrap();
         assert_eq!(recovered, vec![task.id]);
@@ -143,7 +143,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let task = store.add_task(new_task("multi-run task")).unwrap();
         store.claim_task(task.id).unwrap();
-        let r1 = store.start_run(task.id, "local").unwrap();
+        let r1 = store.start_run(task.id, "local", None).unwrap();
         store
             .finish_run(
                 r1,
@@ -156,7 +156,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let r2 = store.start_run(task.id, "alt").unwrap();
+        let r2 = store.start_run(task.id, "alt", None).unwrap();
 
         let recovered = recover_interrupted(&mut store).unwrap();
         assert_eq!(recovered, vec![task.id]);
@@ -177,11 +177,11 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let t1 = store.add_task(new_task("task 1")).unwrap();
         store.claim_task(t1.id).unwrap();
-        let r1 = store.start_run(t1.id, "local").unwrap();
+        let r1 = store.start_run(t1.id, "local", None).unwrap();
 
         let t2 = store.add_task(new_task("task 2")).unwrap();
         store.claim_task(t2.id).unwrap();
-        let r2 = store.start_run(t2.id, "alt").unwrap();
+        let r2 = store.start_run(t2.id, "alt", None).unwrap();
 
         let recovered = recover_interrupted(&mut store).unwrap();
         assert_eq!(recovered, vec![t1.id, t2.id]);

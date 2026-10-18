@@ -116,6 +116,7 @@ pub struct Run {
     pub failure: Option<String>,
     pub transcript_path: Option<PathBuf>,
     pub branch: Option<String>,
+    pub skills: Option<String>,
 }
 
 /// Values written when a run finishes.

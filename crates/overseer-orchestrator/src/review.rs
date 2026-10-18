@@ -488,7 +488,7 @@ async fn run_reviewer_attempt(
         let run_id = {
             let mut store = store_mutex.lock().await;
             store
-                .start_run(task_id, &profile.name)
+                .start_run(task_id, &profile.name, None)
                 .map_err(store_step("start run"))?
         };
 

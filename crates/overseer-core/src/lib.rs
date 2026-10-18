@@ -1,6 +1,7 @@
 //! Domain types for the overseer task orchestrator.
 
 mod config;
+mod lesson;
 mod permissions;
 mod review;
 mod run;
@@ -8,6 +9,7 @@ mod status;
 mod task;
 
 pub use config::{BackendKind, Config, LearningConfig, Profile, ReviewConfig, is_valid_skill_name};
+pub use lesson::{Lesson, LessonId, LessonStatus, NewLesson};
 pub use permissions::Permissions;
 pub use review::{
     NewReview, ParsedReview, ReviewParseError, ReviewRecord, Verdict, parse_review, parse_verdict,
