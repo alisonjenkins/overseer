@@ -69,6 +69,12 @@ pub enum Command {
     },
     /// Print status of the task queue, worker, and recent runs.
     Status,
+    /// Check whether configured profiles can run right now.
+    Doctor {
+        /// Additionally run each healthy backend once with a test prompt.
+        #[arg(long)]
+        deep: bool,
+    },
     /// Show or change the routing mode.
     #[command(subcommand)]
     Mode(ModeCommand),

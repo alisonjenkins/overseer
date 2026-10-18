@@ -2,9 +2,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use overseer_core::{Config, NewTask, Run, Task, TaskId, TaskStatus};
+use overseer_core::{BackendKind, Config, NewTask, Run, Task, TaskId, TaskStatus};
 use overseer_orchestrator::{
     RunSummary, ShutdownSignal, WorkerError, WorkerLockError, WorkerOptions, check_worker_status,
+    doctor_report,
 };
 
 use crate::cli::{Command, ModeCommand, Switch, TaskCommand};
@@ -89,6 +90,7 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<Ex
             run_status(&dir)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Doctor { deep } => run_doctor(&dir, deep).map_err(CliError::from),
         Command::Mode(mode) => {
             run_mode(&dir, mode)?;
             Ok(ExitCode::SUCCESS)
@@ -515,4 +517,127 @@ fn run_status(dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_doctor(dir: &Path, deep: bool) -> Result<ExitCode> {
+    let config = state::load_config(dir)?;
+    let credits_low = match state::open_existing_store(dir) {
+        Ok(store) => store.credits_low().unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+
+    let mut checks = std::collections::HashMap::new();
+    for profile in &config.profiles {
+        let health = runtime.block_on(overseer_backends::check_profile(profile, deep));
+        checks.insert(profile.name.clone(), health);
+    }
+
+    let report = doctor_report(&config, credits_low, &checks);
+    print_doctor_report(&report);
+
+    if report.verdict.is_usable() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(2))
+    }
+}
+
+fn print_doctor_report(report: &overseer_orchestrator::Report) {
+    let profile_width = report
+        .profiles
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(7)
+        .max("PROFILE".len());
+    let backend_width = report
+        .profiles
+        .iter()
+        .map(|p| match p.backend {
+            BackendKind::Openai => "openai".len(),
+            BackendKind::Command => "command".len(),
+        })
+        .max()
+        .unwrap_or(7)
+        .max("BACKEND".len());
+    let health_width = report
+        .profiles
+        .iter()
+        .map(|p| {
+            if p.health.ok {
+                "ok".len()
+            } else {
+                "unhealthy".len()
+            }
+        })
+        .max()
+        .unwrap_or(7)
+        .max("HEALTH".len());
+    let metered_width = "METERED".len();
+
+    println!(
+        "{:<p_w$}  {:<b_w$}  {:<h_w$}  {:<m_w$}  DETAIL",
+        "PROFILE",
+        "BACKEND",
+        "HEALTH",
+        "METERED",
+        p_w = profile_width,
+        b_w = backend_width,
+        h_w = health_width,
+        m_w = metered_width,
+    );
+
+    for p in &report.profiles {
+        let health_str = if p.health.ok { "ok" } else { "unhealthy" };
+        let metered_str = if p.metered { "yes" } else { "no" };
+        let detail_str = if p.health.detail.is_empty() {
+            "-"
+        } else {
+            &p.health.detail
+        };
+        println!(
+            "{:<p_w$}  {:<b_w$}  {:<h_w$}  {:<m_w$}  {}",
+            p.name,
+            match p.backend {
+                BackendKind::Openai => "openai",
+                BackendKind::Command => "command",
+            },
+            health_str,
+            metered_str,
+            detail_str,
+            p_w = profile_width,
+            b_w = backend_width,
+            h_w = health_width,
+            m_w = metered_width,
+        );
+    }
+
+    println!();
+    let plan_str = if report.default_plan.is_empty() {
+        "(none)".to_owned()
+    } else {
+        report
+            .default_plan
+            .iter()
+            .map(|entry| {
+                if entry.health.ok {
+                    entry.name.clone()
+                } else {
+                    format!("{} (unhealthy)", entry.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    };
+    println!("default plan: {plan_str}");
+    println!(
+        "credits-low: {}",
+        if report.credits_low { "on" } else { "off" }
+    );
+    println!("verdict: {}", report.verdict);
 }
