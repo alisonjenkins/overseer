@@ -1016,6 +1016,7 @@ dependencies = [
  "async-trait",
  "overseer-core",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

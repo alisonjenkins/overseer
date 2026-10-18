@@ -9,6 +9,7 @@ mod command;
 mod error;
 mod mock;
 mod openai;
+pub mod tools;
 
 use async_trait::async_trait;
 use overseer_core::{BackendKind, FailureKind, Profile, RunOutcome, RunRequest};
