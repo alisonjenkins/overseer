@@ -1,11 +1,91 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, Permissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1500;
+
+const STARTER_TEMPLATE: &str = r#"# overseer.toml: where task worktrees come from and how tasks are run.
+#
+# A task runs on its profile, or on default_profile when it names none. An
+# attempt that fails with quota-exhausted, auth-required or unreachable moves to
+# the next profile in that profile's fallback list. Any other failure blocks the
+# task.
+#
+# To use claude first, set default_profile = "claude". It then falls back to
+# gemini, then local, whenever it cannot run.
+
+# Repository that task worktrees are created from.
+repo = {repo}
+
+# Profile for tasks that do not name one with --profile.
+default_profile = "local"
+
+# A llama.cpp-style server on this machine. An openai backend returns text only
+# and cannot edit files.
+[[profiles]]
+name = "local"
+backend = "openai"
+# Model name sent to the server.
+model = "local"
+# Base URL of any OpenAI-compatible server.
+base_url = "http://127.0.0.1:8080/v1"
+# Most this profile may be granted: read, write-workdir or write-shell.
+permissions = "write-workdir"
+# Seconds before an attempt gives up. For openai a timeout counts as unreachable,
+# so the chain moves on; for command a timeout blocks the task.
+timeout_secs = 1500
+# System prompt sent before the task text.
+role_prompt = "You are a careful senior engineer."
+# Profiles to try, in order, when this one cannot run. Empty: local ends the chain.
+fallback = []
+
+# Gemini through the agy CLI. Needs `agy` on PATH and signed in.
+[[profiles]]
+name = "gemini"
+# command backend: runs this argv in the task worktree with the prompt appended
+# as the last argument.
+backend = "command"
+command = ["agy", "-p", "--model", "gemini-3.8-flash-medium"]
+permissions = "write-workdir"
+role_prompt = "You are a careful senior engineer."
+fallback = ["local"]
+# Extra arguments added for each permission level a run is granted. A level that
+# is not listed adds nothing.
+[profiles.permission_args]
+read = []
+write-workdir = ["--mode", "accept-edits"]
+write-shell = ["--dangerously-skip-permissions"]
+
+# Claude Code CLI. Metered: runs spend paid credits, so credits-low mode skips
+# this profile, and a quota failure here turns credits-low on.
+[[profiles]]
+name = "claude"
+backend = "command"
+command = ["claude", "-p"]
+metered = true
+# Ceiling for this profile. Raise it to "write-shell" to let the write-shell
+# argument below take effect.
+permissions = "write-workdir"
+role_prompt = "You are a careful senior engineer."
+fallback = ["gemini", "local"]
+[profiles.permission_args]
+read = ["--permission-mode", "plan"]
+write-workdir = ["--permission-mode", "acceptEdits"]
+write-shell = ["--dangerously-skip-permissions"]
+
+# Untested example of opencode's run command. The test suite never runs it and
+# its flags are not checked against any opencode version; check them before use.
+[[profiles]]
+name = "opencode-local"
+backend = "command"
+command = ["opencode", "run"]
+permissions = "write-workdir"
+role_prompt = "You are a careful senior engineer."
+fallback = []
+"#;
 
 /// Which backend implementation a profile selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,28 +174,12 @@ impl Config {
         Ok(config)
     }
 
-    /// The configuration `overseer init` writes: one `local` profile pointing
-    /// at a llama.cpp-style server on 127.0.0.1:8080.
-    pub fn starter(repo: PathBuf) -> Self {
-        Self {
-            repo,
-            default_profile: "local".to_owned(),
-            profiles: vec![Profile {
-                name: "local".to_owned(),
-                backend: BackendKind::Openai,
-                model: Some("local".to_owned()),
-                base_url: Some("http://127.0.0.1:8080/v1".to_owned()),
-                api_key_env: None,
-                command: None,
-                prompt_stdin: false,
-                role_prompt: Some("You are a careful senior engineer.".to_owned()),
-                fallback: Vec::new(),
-                permissions: Permissions::WriteWorkdir,
-                timeout_secs: DEFAULT_TIMEOUT_SECS,
-                metered: false,
-                permission_args: BTreeMap::new(),
-            }],
-        }
+    /// The `overseer.toml` that `overseer init` writes, with a comment for
+    /// every field. It is a template rather than a serialised `Config` so the
+    /// comments survive; the `{repo}` placeholder becomes the repository path.
+    pub fn starter_toml(repo: &Path) -> String {
+        let repo_text = toml::Value::String(repo.to_string_lossy().into_owned()).to_string();
+        STARTER_TEMPLATE.replace("{repo}", &repo_text)
     }
 
     /// Serialise to the `overseer.toml` format.
@@ -401,30 +465,39 @@ command = []
     }
 
     #[test]
-    fn starter_config_is_valid_and_points_at_local_server() {
-        let config = Config::starter(PathBuf::from("/work/project"));
-        config.validate().unwrap();
-        let profile = config.profile("local").unwrap();
+    fn starter_config_is_valid_and_routes_claude_to_gemini_then_local() {
+        let config =
+            Config::from_toml_str(&Config::starter_toml(Path::new("/work/project"))).unwrap();
         assert_eq!(config.default_profile, "local");
+        let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["local", "gemini", "claude", "opencode-local"]);
+
+        let local = config.profile("local").unwrap();
+        assert_eq!(local.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert!(local.fallback.is_empty());
+        assert!(!local.metered);
+
+        let gemini = config.profile("gemini").unwrap();
+        assert_eq!(gemini.fallback, ["local"]);
         assert_eq!(
-            profile.base_url.as_deref(),
-            Some("http://127.0.0.1:8080/v1")
+            gemini.permission_args.get(&Permissions::Read),
+            Some(&Vec::new())
         );
-        assert_eq!(profile.model.as_deref(), Some("local"));
-        assert_eq!(profile.permissions, Permissions::WriteWorkdir);
-        assert_eq!(profile.timeout_secs, 1500);
+
+        let claude = config.profile("claude").unwrap();
+        assert_eq!(claude.fallback, ["gemini", "local"]);
+        assert!(claude.metered);
         assert_eq!(
-            profile.role_prompt.as_deref(),
-            Some("You are a careful senior engineer.")
+            claude.permission_args.get(&Permissions::Read),
+            Some(&vec!["--permission-mode".to_owned(), "plan".to_owned()])
         );
     }
 
     #[test]
-    fn starter_config_serialises_and_parses_back() {
-        let config = Config::starter(PathBuf::from("/work/project"));
-        let text = config.to_toml_string().unwrap();
-        assert!(text.contains("default_profile = \"local\""), "{text}");
-        assert_eq!(Config::from_toml_str(&text).unwrap(), config);
+    fn starter_config_quotes_the_repo_path_and_parses_back() {
+        let repo = PathBuf::from("/work/my \"project\"");
+        let config = Config::from_toml_str(&Config::starter_toml(&repo)).unwrap();
+        assert_eq!(config.repo, repo);
     }
 
     #[test]

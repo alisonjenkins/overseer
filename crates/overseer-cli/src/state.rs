@@ -53,13 +53,10 @@ pub fn config_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONFIG_FILE_NAME)
 }
 
-/// Write `config` to `overseer.toml` only if no such file exists. Returns
+/// Write `text` to `overseer.toml` only if no such file exists. Returns
 /// `false`, leaving the file untouched, when it already exists.
-pub fn write_starter_config(state_dir: &Path, config: &Config) -> Result<bool> {
+pub fn write_starter_config(state_dir: &Path, text: &str) -> Result<bool> {
     let path = config_path(state_dir);
-    let text = config
-        .to_toml_string()
-        .context("failed to render the starter config")?;
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
@@ -116,14 +113,14 @@ mod tests {
     #[test]
     fn starter_config_is_written_once_and_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::starter(PathBuf::from("/work/project"));
+        let text = Config::starter_toml(&PathBuf::from("/work/project"));
 
-        assert!(write_starter_config(dir.path(), &config).unwrap());
+        assert!(write_starter_config(dir.path(), &text).unwrap());
         let written = std::fs::read_to_string(config_path(dir.path())).unwrap();
-        assert_eq!(Config::from_toml_str(&written).unwrap(), config);
+        assert_eq!(written, text);
 
         std::fs::write(config_path(dir.path()), "# edited by hand\n").unwrap();
-        assert!(!write_starter_config(dir.path(), &config).unwrap());
+        assert!(!write_starter_config(dir.path(), &text).unwrap());
         let kept = std::fs::read_to_string(config_path(dir.path())).unwrap();
         assert_eq!(kept, "# edited by hand\n");
     }

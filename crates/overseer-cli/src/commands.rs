@@ -1,13 +1,18 @@
 use std::path::Path;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use overseer_core::{Config, NewTask, Run, Task, TaskId};
+use overseer_core::{Config, NewTask, Run, Task, TaskId, TaskStatus};
 use overseer_orchestrator::RunSummary;
 
-use crate::cli::{Command, TaskCommand};
+use crate::cli::{Command, ModeCommand, Switch, TaskCommand};
 use crate::state;
 
-pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<()> {
+/// Exit code for a run that ended with its task blocked, so scripts can tell it
+/// from an overseer error (exit 1).
+const EXIT_BLOCKED: u8 = 2;
+
+pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<ExitCode> {
     let dir = state::resolve_state_dir(state_dir)?;
     match command {
         Command::Init { repo } => {
@@ -20,20 +25,21 @@ pub fn run(state_dir: Option<std::path::PathBuf>, command: Command) -> Result<()
                 None => std::env::current_dir().context("cannot read the current directory")?,
             };
             let config_path = state::config_path(&dir);
-            if state::write_starter_config(&dir, &Config::starter(repo))? {
+            if state::write_starter_config(&dir, &Config::starter_toml(&repo))? {
                 println!("wrote starter config {}", config_path.display());
             } else {
                 println!("kept existing config {}", config_path.display());
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
-        Command::Task(task) => run_task(&dir, task),
+        Command::Task(task) => run_task(&dir, task).map(|()| ExitCode::SUCCESS),
         Command::Run { id } => run_one(&dir, id),
-        Command::Runs { task_id } => list_runs(&dir, task_id),
+        Command::Runs { task_id } => list_runs(&dir, task_id).map(|()| ExitCode::SUCCESS),
+        Command::Mode(mode) => run_mode(&dir, mode).map(|()| ExitCode::SUCCESS),
     }
 }
 
-fn run_one(dir: &Path, id: i64) -> Result<()> {
+fn run_one(dir: &Path, id: i64) -> Result<ExitCode> {
     let config = state::load_config(dir)?;
     let mut store = state::open_existing_store(dir)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -49,6 +55,27 @@ fn run_one(dir: &Path, id: i64) -> Result<()> {
         ))
         .with_context(|| format!("failed to run task {id}"))?;
     print_run_summary(&summary);
+    Ok(if summary.status == TaskStatus::Blocked {
+        ExitCode::from(EXIT_BLOCKED)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn run_mode(dir: &Path, command: ModeCommand) -> Result<()> {
+    let mut store = state::open_existing_store(dir)?;
+    match command {
+        ModeCommand::Show => {}
+        ModeCommand::CreditsLow { state } => {
+            store
+                .set_credits_low(state == Switch::On)
+                .context("failed to set credits-low mode")?;
+        }
+    }
+    let credits_low = store
+        .credits_low()
+        .context("failed to read credits-low mode")?;
+    println!("credits-low: {}", if credits_low { "on" } else { "off" });
     Ok(())
 }
 
@@ -80,6 +107,14 @@ fn print_run_summary(summary: &RunSummary) {
     match &summary.transcript_path {
         Some(path) => println!("transcript: {}", path.display()),
         None => println!("transcript: -"),
+    }
+    println!("attempts:");
+    for attempt in &summary.attempts {
+        let outcome = attempt
+            .failure
+            .as_ref()
+            .map_or_else(|| "succeeded".to_owned(), |kind| format!("failed ({kind})"));
+        println!("  run {}: {} {outcome}", attempt.run_id, attempt.profile);
     }
 }
 

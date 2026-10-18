@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use overseer_core::TaskStatus;
 
 /// Single-user agentic task orchestrator.
@@ -37,6 +37,27 @@ pub enum Command {
         /// Id of the task whose runs to list.
         task_id: i64,
     },
+    /// Show or change the routing mode.
+    #[command(subcommand)]
+    Mode(ModeCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModeCommand {
+    /// Print the current routing mode.
+    Show,
+    /// Turn credits-low mode on or off. While it is on, metered profiles are
+    /// skipped and a quota failure on one of them does not retry it.
+    CreditsLow {
+        #[arg(value_enum)]
+        state: Switch,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]

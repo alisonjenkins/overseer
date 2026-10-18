@@ -5,6 +5,7 @@
 //! temp directories, so nothing outside the test is touched.
 
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
@@ -171,9 +172,17 @@ async fn unreachable_backend_blocks_the_task_and_records_why() {
     point_config_at(&fx.state, &closed_port_url());
     stdout_of(&fx.state, &["task", "add", "write parser"]);
 
-    let run = stdout_of(&fx.state, &["run", "1"]);
+    let output = overseer(&fx.state)
+        .args(["run", "1"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let run = String::from_utf8(output).unwrap();
     assert!(run.contains("task: 1 -> blocked"), "{run}");
     assert!(run.contains("outcome: failed (unreachable)"), "{run}");
+    assert!(run.contains("run 1: local failed (unreachable)"), "{run}");
 
     let shown = stdout_of(&fx.state, &["task", "show", "1"]);
     assert!(shown.contains("status: blocked"), "{shown}");
@@ -220,4 +229,134 @@ async fn run_of_unknown_task_fails_with_the_store_reason() {
 
     let stderr = stderr_of_failure(&fx.state, &["run", "42"]);
     assert!(stderr.contains("no task with id 42"), "{stderr}");
+}
+
+/// Write an executable `#!/bin/sh` program at `path` with `body` after the
+/// shebang, and return its path.
+fn write_program(path: &Path, body: &str) -> PathBuf {
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_path_buf()
+}
+
+/// An `agy` stand-in that answers with its last argument (the prompt) and
+/// writes one file into the working directory.
+fn fake_agy(dir: &Path) -> PathBuf {
+    write_program(
+        &dir.join("agy"),
+        "for last; do :; done\necho \"agy: $last\"\necho done > agy-output.txt\n",
+    )
+}
+
+fn write_config(state_dir: &Path, text: &str) {
+    std::fs::write(state_dir.join("overseer.toml"), text).unwrap();
+}
+
+#[tokio::test]
+async fn attempts_fall_back_from_a_dead_local_server_to_agy() {
+    let fx = setup();
+    stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
+    let agy = fake_agy(fx._root.path());
+    write_config(
+        &fx.state,
+        &format!(
+            r#"repo = "{repo}"
+default_profile = "local"
+
+[[profiles]]
+name = "local"
+backend = "openai"
+model = "local"
+base_url = "{dead}"
+fallback = ["gemini"]
+
+[[profiles]]
+name = "gemini"
+backend = "command"
+command = ["{agy}"]
+permissions = "write-workdir"
+"#,
+            repo = fx.repo.display(),
+            dead = closed_port_url(),
+            agy = agy.display(),
+        ),
+    );
+    stdout_of(&fx.state, &["task", "add", "write parser"]);
+
+    let run = stdout_of(&fx.state, &["run", "1"]);
+    assert!(run.contains("task: 1 -> review"), "{run}");
+    assert!(run.contains("outcome: succeeded"), "{run}");
+    assert!(run.contains("profile: gemini"), "{run}");
+    assert!(run.contains("run 1: local failed (unreachable)"), "{run}");
+    assert!(run.contains("run 2: gemini succeeded"), "{run}");
+
+    let runs = stdout_of(&fx.state, &["runs", "1"]);
+    assert!(
+        runs.contains("unreachable") && runs.contains("succeeded"),
+        "{runs}"
+    );
+    let committed = git(&fx.repo, &["show", "overseer/task-1:agy-output.txt"]);
+    assert_eq!(committed.trim(), "done");
+}
+
+#[tokio::test]
+async fn credits_low_mode_skips_the_metered_claude_profile() {
+    let fx = setup();
+    stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
+    let agy = fake_agy(fx._root.path());
+    let claude = write_program(&fx._root.path().join("claude"), "echo boom >&2\nexit 1\n");
+    write_config(
+        &fx.state,
+        &format!(
+            r#"repo = "{repo}"
+default_profile = "claude"
+
+[[profiles]]
+name = "claude"
+backend = "command"
+command = ["{claude}"]
+metered = true
+permissions = "write-workdir"
+fallback = ["gemini"]
+
+[[profiles]]
+name = "gemini"
+backend = "command"
+command = ["{agy}"]
+permissions = "write-workdir"
+"#,
+            repo = fx.repo.display(),
+            claude = claude.display(),
+            agy = agy.display(),
+        ),
+    );
+    assert_eq!(
+        stdout_of(&fx.state, &["mode", "show"]).trim(),
+        "credits-low: off"
+    );
+    assert_eq!(
+        stdout_of(&fx.state, &["mode", "credits-low", "on"]).trim(),
+        "credits-low: on"
+    );
+    assert_eq!(
+        stdout_of(&fx.state, &["mode", "show"]).trim(),
+        "credits-low: on"
+    );
+    stdout_of(&fx.state, &["task", "add", "cheap work"]);
+
+    let run = stdout_of(&fx.state, &["run", "1"]);
+    assert!(run.contains("outcome: succeeded"), "{run}");
+    assert!(run.contains("run 1: gemini succeeded"), "{run}");
+    assert!(!run.contains("claude"), "{run}");
+}
+
+#[tokio::test]
+async fn init_writes_the_routing_profiles_with_comments() {
+    let fx = setup();
+    stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
+    let text = std::fs::read_to_string(fx.state.join("overseer.toml")).unwrap();
+    assert!(text.contains("name = \"claude\""), "{text}");
+    assert!(text.contains("name = \"gemini\""), "{text}");
+    assert!(text.contains("name = \"opencode-local\""), "{text}");
+    assert!(text.contains("# Untested example"), "{text}");
 }

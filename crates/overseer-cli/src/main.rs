@@ -11,7 +11,7 @@ fn main() -> ExitCode {
     init_tracing();
     let cli = cli::Cli::parse();
     match commands::run(cli.state_dir, cli.command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("overseer: {err:#}");
             ExitCode::FAILURE
