@@ -100,7 +100,7 @@ profile's `permissions` ceiling.
 installed version before relying on them; the test suite does not run them.
 
 - `local`: the default profile, an `openai` server on `127.0.0.1:8080`.
-- `gemini`: `agy -p --model gemini-3.8-flash-medium`, with `agy` flags for each
+- `gemini`: `agy --model gemini-3.8-flash-medium`, `prompt_flag = "-p"`, with `agy` flags for each
   permission level. Falls back to `local`.
 - `claude`: `claude -p`, `metered = true`, with `--permission-mode` flags.
   Falls back to `gemini`, then `local`.
@@ -169,6 +169,7 @@ warning. The remaining metered profiles in that task's plan are then skipped.
 | `base_url` | string | required for `openai` | Base URL, e.g. `http://127.0.0.1:8080/v1`. |
 | `api_key_env` | string | none | Name of the environment variable holding the API key. |
 | `command` | array of strings | required for `command` | argv, run in the worktree. |
+| `prompt_flag` | string | none | Flag preceding the prompt argument for `command` (e.g. `"-p"`). |
 | `prompt_stdin` | bool | `false` | Send the prompt on stdin instead of as the last argument. |
 | `role_prompt` | string | none | System prompt, sent ahead of the task text. |
 | `fallback` | array of profile names | `[]` | Profiles to try, in order, after this one fails routably. |
