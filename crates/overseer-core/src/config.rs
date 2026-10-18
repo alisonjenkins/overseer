@@ -43,6 +43,21 @@ role_prompt = "You are a careful senior engineer."
 # Profiles to try, in order, when this one cannot run. Empty: local ends the chain.
 fallback = []
 
+# A local model running with the agent tool loop so it can inspect and edit
+# files in the task worktree. It needs a llama-server started with tool calling (`--jinja`)
+# and a model with a tool-capable chat template.
+[[profiles]]
+name = "local-edit"
+backend = "openai"
+model = "local"
+base_url = "http://127.0.0.1:8080/v1"
+permissions = "write-workdir"
+timeout_secs = 1500
+role_prompt = "You are a careful senior engineer."
+agent_tools = true
+max_steps = 40
+fallback = []
+
 # Gemini through the agy CLI. Needs `agy` on PATH and signed in.
 # agy must be signed in (run `agy` once interactively).
 [[profiles]]
@@ -602,14 +617,33 @@ command = []
             Config::from_toml_str(&Config::starter_toml(Path::new("/work/project"))).unwrap();
         assert_eq!(config.default_profile, "local");
         let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["local", "gemini", "claude", "local-agent"]);
+        assert_eq!(
+            names,
+            ["local", "local-edit", "gemini", "claude", "local-agent"]
+        );
 
         let local = config.profile("local").unwrap();
         assert_eq!(local.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
         assert!(local.fallback.is_empty());
         assert!(!local.metered);
 
+        let local_edit = config.profile("local-edit").unwrap();
+        assert_eq!(local_edit.backend, BackendKind::Openai);
+        assert_eq!(local_edit.model.as_deref(), Some("local"));
+        assert_eq!(
+            local_edit.base_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert!(local_edit.agent_tools);
+        assert_eq!(local_edit.max_steps, 40);
+        assert_eq!(local_edit.permissions, Permissions::WriteWorkdir);
+        assert!(local_edit.fallback.is_empty());
+
         let starter = Config::starter_toml(Path::new("/work/project"));
+        assert!(
+            starter.contains("needs a llama-server started with tool calling (`--jinja`)"),
+            "{starter}"
+        );
         assert!(
             starter.contains("agy must be signed in (run `agy` once interactively)"),
             "{starter}"

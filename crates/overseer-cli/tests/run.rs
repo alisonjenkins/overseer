@@ -355,6 +355,8 @@ async fn init_writes_the_routing_profiles_with_comments() {
     let fx = setup();
     stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
     let text = std::fs::read_to_string(fx.state.join("overseer.toml")).unwrap();
+    assert!(text.contains("name = \"local-edit\""), "{text}");
+    assert!(text.contains("--jinja"), "{text}");
     assert!(text.contains("name = \"claude\""), "{text}");
     assert!(text.contains("name = \"gemini\""), "{text}");
     assert!(text.contains("name = \"local-agent\""), "{text}");
