@@ -46,8 +46,9 @@ pub use runner::{
 };
 pub use sources::{SourceBuildError, SpecKitSource, build_sources};
 pub use split::{
-    SplitApplyError, SplitError, SplitPlan, SplitSubtask, apply_split, build_split_prompt,
-    complete_split_parents, parse_split, request_split,
+    RUNAWAY_CONTEXT_BUDGET, RUNAWAY_MAX_STEPS, RUNAWAY_STATUS_500, SplitApplyError, SplitError,
+    SplitPlan, SplitStepError, SplitSubtask, apply_split, build_split_prompt,
+    complete_split_parents, is_runaway, parse_split, request_split, split_task,
 };
 pub use sync::{SyncError, SyncReport, sync_sources};
 pub use watch::{SourceWatcher, WatchError, start};

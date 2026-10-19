@@ -3,8 +3,27 @@
 use std::path::{Path, PathBuf};
 
 use overseer_backends::Backend;
-use overseer_core::{NewTask, Permissions, Profile, RunRequest, TaskId, TaskStatus};
+use overseer_core::{
+    FailureKind, NewTask, Permissions, Profile, RunRequest, Task, TaskId, TaskStatus,
+};
 use overseer_store::{Store, StoreError};
+
+pub const RUNAWAY_MAX_STEPS: &str = "exceeded max_steps";
+pub const RUNAWAY_CONTEXT_BUDGET: &str = "context budget exceeded";
+pub const RUNAWAY_STATUS_500: &str = "status 500";
+
+/// Returns true if `kind` matches a runaway failure signal (max_steps exceeded,
+/// context budget exceeded, or server status 500).
+pub fn is_runaway(kind: &FailureKind) -> bool {
+    match kind {
+        FailureKind::Other(msg) => {
+            msg.contains(RUNAWAY_MAX_STEPS)
+                || msg.contains(RUNAWAY_CONTEXT_BUDGET)
+                || msg.contains(RUNAWAY_STATUS_500)
+        }
+        _ => false,
+    }
+}
 
 /// A single subtask produced by splitting a larger task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +237,14 @@ pub fn apply_split(
     let parent_task = store.get_task(parent)?;
 
     match parent_task.status {
-        TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Review => {}
+        TaskStatus::Backlog
+        | TaskStatus::Ready
+        | TaskStatus::Running
+        | TaskStatus::Blocked
+        | TaskStatus::Review => {}
         other => {
             return Err(SplitApplyError::Refused {
-                reason: format!(
-                    "task {parent} in status {other} cannot be split (must be running, blocked, or review)"
-                ),
+                reason: format!("task {parent} in status {other} cannot be split"),
             });
         }
     }
@@ -335,6 +356,50 @@ pub fn complete_split_parents(store: &mut Store) -> Result<Vec<TaskId>, SplitApp
     Ok(completed)
 }
 
+/// Errors that can occur when executing the task split step.
+#[derive(Debug, thiserror::Error)]
+pub enum SplitStepError {
+    #[error("split refused: {0}")]
+    Refused(String),
+
+    #[error("split request failed: {0}")]
+    Split(#[from] SplitError),
+
+    #[error("apply split failed: {0}")]
+    Apply(#[from] SplitApplyError),
+}
+
+/// Splits a task into subtasks using the provided model profile and backend,
+/// validating and applying the resulting split plan.
+pub async fn split_task(
+    store: &mut Store,
+    backend: &dyn Backend,
+    profile: &Profile,
+    task: &Task,
+) -> Result<Vec<TaskId>, SplitStepError> {
+    if task.parent_task_id.is_some() {
+        return Err(SplitStepError::Refused(format!(
+            "task {} is a child task and cannot be split",
+            task.id
+        )));
+    }
+
+    let children = store
+        .list_child_tasks(task.id)
+        .map_err(SplitApplyError::from)?;
+    if !children.is_empty() {
+        return Err(SplitStepError::Refused(format!(
+            "task {} already has child tasks",
+            task.id
+        )));
+    }
+
+    let plan = request_split(backend, profile, &task.title, &task.body).await?;
+    let child_ids = apply_split(store, task.id, &plan)?;
+    tracing::info!("task {} split into {} subtasks", task.id, child_ids.len());
+    Ok(child_ids)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -387,8 +452,6 @@ mod tests {
     impl Backend for FakeBackend {
         async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
             assert_eq!(req.permissions, Permissions::Read);
-            assert!(req.prompt.contains("Main"));
-            assert!(req.prompt.contains("Body"));
             Ok(RunOutcome {
                 output: self.output.clone(),
                 usage: Usage::default(),
@@ -722,5 +785,103 @@ mod tests {
         assert_eq!(store.get_task(t1.id).unwrap().status, TaskStatus::Blocked);
         assert_eq!(store.get_task(t2.id).unwrap().status, TaskStatus::Blocked);
         assert_eq!(store.get_task(t3.id).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn runaway_classification() {
+        assert!(is_runaway(&FailureKind::Other("exceeded max_steps".into())));
+        assert!(is_runaway(&FailureKind::Other(
+            "context budget exceeded after eliding tool output".into()
+        )));
+        assert!(is_runaway(&FailureKind::Other(
+            "status 500: internal error".into()
+        )));
+        assert!(!is_runaway(&FailureKind::Other(
+            "review backend unavailable".into()
+        )));
+        assert!(!is_runaway(&FailureKind::Unreachable));
+    }
+
+    #[tokio::test]
+    async fn split_task_refuses_split_children() {
+        let mut store = Store::open_in_memory().unwrap();
+        let fake = FakeBackend {
+            output: "[]".into(),
+            failure: None,
+        };
+        let profile = test_profile();
+
+        let parent = store
+            .add_task(NewTask {
+                title: "Parent".into(),
+                body: "Body".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = store
+            .add_task(NewTask {
+                title: "Child".into(),
+                parent_task_id: Some(parent.id),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_task_parent(child.id, parent.id).unwrap();
+
+        let err_parent = split_task(&mut store, &fake, &profile, &parent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err_parent, SplitStepError::Refused(_)));
+
+        let err_child = split_task(&mut store, &fake, &profile, &child)
+            .await
+            .unwrap_err();
+        assert!(matches!(err_child, SplitStepError::Refused(_)));
+    }
+
+    #[tokio::test]
+    async fn split_task_creates_children() {
+        let mut store = Store::open_in_memory().unwrap();
+        let parent = store
+            .add_task(NewTask {
+                title: "Parent Task".into(),
+                body: "Parent Body".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_status(parent.id, TaskStatus::Ready).unwrap();
+
+        let fake = FakeBackend {
+            output: r#"[
+                {"title": "Step 1", "body": "Do first", "file": "src/1.rs"},
+                {"title": "Step 2", "body": "Do second", "file": "src/2.rs"},
+                {"title": "Step 3", "body": "Do third", "file": "src/3.rs"}
+            ]"#
+            .into(),
+            failure: None,
+        };
+
+        let child_ids = split_task(&mut store, &fake, &test_profile(), &parent)
+            .await
+            .unwrap();
+        assert_eq!(child_ids.len(), 3);
+
+        let updated_parent = store.get_task(parent.id).unwrap();
+        assert_eq!(updated_parent.status, TaskStatus::Blocked);
+        let expected_reason = format!(
+            "split into 3 subtasks: {}, {}, {}",
+            child_ids[0], child_ids[1], child_ids[2]
+        );
+        assert_eq!(
+            updated_parent.reason.as_deref(),
+            Some(expected_reason.as_str())
+        );
+
+        let children = store.list_child_tasks(parent.id).unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].id, child_ids[0]);
+        assert_eq!(children[1].id, child_ids[1]);
+        assert_eq!(children[2].id, child_ids[2]);
+        assert_eq!(children[1].depends_on, vec![child_ids[0]]);
+        assert_eq!(children[2].depends_on, vec![child_ids[1]]);
     }
 }

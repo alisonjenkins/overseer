@@ -527,6 +527,40 @@ async fn execute(
             )
         }
     } else {
+        if let Some(ref failure_kind) = last.failure
+            && crate::split::is_runaway(failure_kind)
+            && task.parent_task_id.is_none()
+        {
+            let children = store
+                .list_child_tasks(task_id)
+                .map_err(store_step("list child tasks"))?;
+            if children.is_empty()
+                && let Some(&backend) = backends.get(last.profile.as_str())
+                && let Some(&profile) = plan.iter().find(|p| p.name == last.profile)
+            {
+                match crate::split::split_task(store, backend, profile, &task).await {
+                    Ok(_) => {
+                        let updated = store.get_task(task_id).map_err(store_step("get task"))?;
+                        return Ok(RunSummary {
+                            run_id: last.run_id,
+                            task_id,
+                            profile: last.profile,
+                            status: updated.status,
+                            reason: updated.reason,
+                            failure: last.failure,
+                            branch,
+                            commit,
+                            usage: last.usage,
+                            transcript_path: last.transcript_path,
+                            attempts,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(task_id = task_id.get(), %err, "split task failed");
+                    }
+                }
+            }
+        }
         (
             TaskStatus::Blocked,
             last.failure.as_ref().map(ToString::to_string),
@@ -1434,5 +1468,55 @@ mod tests {
         let stored = fx.store.get_task(task).unwrap();
         assert_eq!(stored.status, TaskStatus::NeedsHuman);
         assert_eq!(stored.reason.as_deref(), Some("escalation: Cargo.toml"));
+    }
+
+    struct RunawaySplittingBackend;
+
+    #[async_trait]
+    impl Backend for RunawaySplittingBackend {
+        async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            if req.permissions == Permissions::Read {
+                Ok(RunOutcome {
+                    output: r#"[
+                        {"title": "Child 1", "body": "Do 1", "file": "src/1.rs"},
+                        {"title": "Child 2", "body": "Do 2", "file": "src/2.rs"},
+                        {"title": "Child 3", "body": "Do 3", "file": "src/3.rs"}
+                    ]"#
+                    .to_owned(),
+                    usage: Usage::default(),
+                    failure: None,
+                })
+            } else {
+                Ok(RunOutcome {
+                    output: String::new(),
+                    usage: Usage::default(),
+                    failure: Some(FailureKind::Other("exceeded max_steps".to_owned())),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runaway_failure_splits_task_once() {
+        let mut fx = fixture();
+        let config = config(&fx.repo);
+        let task = add(&mut fx.store, "big task", "do too much");
+        let backend = RunawaySplittingBackend;
+
+        let summary = run_task_with_backend(&mut fx.store, &config, &fx.state, task, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.status, TaskStatus::Blocked);
+        let parent = fx.store.get_task(task).unwrap();
+        assert_eq!(parent.status, TaskStatus::Blocked);
+        let reason = parent.reason.expect("split reason should be set");
+        assert!(reason.starts_with("split into 3 subtasks:"), "{reason}");
+
+        let children = fx.store.list_child_tasks(task).unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].parent_task_id, Some(task));
+        assert_eq!(children[1].parent_task_id, Some(task));
+        assert_eq!(children[2].parent_task_id, Some(task));
     }
 }
