@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use overseer_backends::Backend;
-use overseer_core::{Permissions, Profile, RunRequest};
+use overseer_core::{NewTask, Permissions, Profile, RunRequest, TaskId, TaskStatus};
+use overseer_store::{Store, StoreError};
 
 /// A single subtask produced by splitting a larger task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,13 +187,162 @@ pub async fn request_split(
     parse_split(&outcome.output)
 }
 
+/// Errors that can occur when applying a task split or completing split parents.
+#[derive(Debug, thiserror::Error)]
+pub enum SplitApplyError {
+    #[error("split refused: {reason}")]
+    Refused { reason: String },
+
+    #[error("store operation failed: {source}")]
+    Store {
+        #[source]
+        source: Box<StoreError>,
+    },
+}
+
+impl From<StoreError> for SplitApplyError {
+    fn from(source: StoreError) -> Self {
+        Self::Store {
+            source: Box::new(source),
+        }
+    }
+}
+
+/// Creates child tasks from a validated split plan, sequences their dependencies,
+/// links them to `parent`, and sets `parent` to Blocked.
+pub fn apply_split(
+    store: &mut Store,
+    parent: TaskId,
+    plan: &SplitPlan,
+) -> Result<Vec<TaskId>, SplitApplyError> {
+    let parent_task = store.get_task(parent)?;
+
+    match parent_task.status {
+        TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Review => {}
+        other => {
+            return Err(SplitApplyError::Refused {
+                reason: format!(
+                    "task {parent} in status {other} cannot be split (must be running, blocked, or review)"
+                ),
+            });
+        }
+    }
+
+    let existing_children = store.list_child_tasks(parent)?;
+    if !existing_children.is_empty() {
+        return Err(SplitApplyError::Refused {
+            reason: format!(
+                "task {parent} already has {} child tasks",
+                existing_children.len()
+            ),
+        });
+    }
+
+    if plan.subtasks.is_empty() {
+        return Err(SplitApplyError::Refused {
+            reason: "split plan contains no subtasks".to_string(),
+        });
+    }
+
+    let total = plan.subtasks.len();
+    let mut created_ids = Vec::with_capacity(total);
+    let mut prev_id: Option<TaskId> = None;
+
+    let cancel_created = |store: &mut Store, ids: &[TaskId]| {
+        for &id in ids {
+            let _ = store.set_status(id, TaskStatus::Cancelled);
+        }
+    };
+
+    for (idx, subtask) in plan.subtasks.iter().enumerate() {
+        let step = idx.saturating_add(1);
+        let extra = format!(
+            "Split from task {parent}, step {step} of {total}. Target file: {}.",
+            subtask.file
+        );
+        let body = if subtask.body.ends_with('\n') {
+            format!("{}{extra}", subtask.body)
+        } else {
+            format!("{}\n{extra}", subtask.body)
+        };
+
+        let depends_on = prev_id.map(|id| vec![id]).unwrap_or_default();
+        let new_task = NewTask {
+            title: subtask.title.clone(),
+            body,
+            priority: parent_task.priority,
+            profile: parent_task.profile.clone(),
+            depends_on,
+            ready: true,
+            source: None,
+            external_id: None,
+            parent_task_id: Some(parent),
+        };
+
+        let child = match store.add_task(new_task) {
+            Ok(task) => task,
+            Err(err) => {
+                cancel_created(store, &created_ids);
+                return Err(SplitApplyError::from(err));
+            }
+        };
+
+        if let Err(err) = store.set_task_parent(child.id, parent) {
+            created_ids.push(child.id);
+            cancel_created(store, &created_ids);
+            return Err(SplitApplyError::from(err));
+        }
+
+        prev_id = Some(child.id);
+        created_ids.push(child.id);
+    }
+
+    let ids_str = created_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = format!("split into {total} subtasks: {ids_str}");
+
+    if let Err(err) = store.set_status_with_reason(parent, TaskStatus::Blocked, Some(&reason)) {
+        cancel_created(store, &created_ids);
+        return Err(SplitApplyError::from(err));
+    }
+
+    Ok(created_ids)
+}
+
+/// Marks a split parent task Done when all of its child tasks are Done.
+pub fn complete_split_parents(store: &mut Store) -> Result<Vec<TaskId>, SplitApplyError> {
+    let blocked_tasks = store.list_tasks(Some(TaskStatus::Blocked))?;
+    let mut completed = Vec::new();
+
+    for task in blocked_tasks {
+        let Some(ref reason) = task.reason else {
+            continue;
+        };
+        if !reason.starts_with("split into ") {
+            continue;
+        }
+
+        let children = store.list_child_tasks(task.id)?;
+        if !children.is_empty() && children.iter().all(|c| c.status == TaskStatus::Done) {
+            store.set_status(task.id, TaskStatus::Done)?;
+            completed.push(task.id);
+        }
+    }
+
+    Ok(completed)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
-        clippy::panic
+        clippy::panic,
+        clippy::arithmetic_side_effects
     )]
 
     use async_trait::async_trait;
@@ -379,5 +529,198 @@ mod tests {
         assert_eq!(plan.subtasks[1].title, "2");
         assert_eq!(plan.subtasks[1].body, "b2");
         assert_eq!(plan.subtasks[1].file, "src/2.rs");
+    }
+
+    #[test]
+    fn apply_split_creates_ordered_children() {
+        let mut store = Store::open_in_memory().unwrap();
+        let parent = store
+            .add_task(NewTask {
+                title: "Parent Task".into(),
+                body: "Parent Body".into(),
+                priority: 3,
+                profile: Some("split-profile".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_status(parent.id, TaskStatus::Running).unwrap();
+
+        let plan = SplitPlan {
+            subtasks: vec![
+                SplitSubtask {
+                    title: "Subtask 1".into(),
+                    body: "Body 1".into(),
+                    file: "crates/a.rs".into(),
+                },
+                SplitSubtask {
+                    title: "Subtask 2".into(),
+                    body: "Body 2".into(),
+                    file: "crates/b.rs".into(),
+                },
+                SplitSubtask {
+                    title: "Subtask 3".into(),
+                    body: "Body 3".into(),
+                    file: "crates/c.rs".into(),
+                },
+            ],
+        };
+
+        let child_ids = apply_split(&mut store, parent.id, &plan).unwrap();
+        assert_eq!(child_ids.len(), 3);
+
+        let c1 = store.get_task(child_ids[0]).unwrap();
+        let c2 = store.get_task(child_ids[1]).unwrap();
+        let c3 = store.get_task(child_ids[2]).unwrap();
+
+        assert!(c1.depends_on.is_empty());
+        assert_eq!(c2.depends_on, vec![c1.id]);
+        assert_eq!(c3.depends_on, vec![c2.id]);
+
+        for (task, (num, file)) in [(&c1, (1, "a")), (&c2, (2, "b")), (&c3, (3, "c"))] {
+            assert_eq!(task.title, format!("Subtask {num}"));
+            assert_eq!(
+                task.body,
+                format!(
+                    "Body {num}\nSplit from task {}, step {num} of 3. Target file: crates/{file}.rs.",
+                    parent.id
+                )
+            );
+            assert_eq!(task.priority, 3);
+            assert_eq!(task.profile.as_deref(), Some("split-profile"));
+            assert_eq!(task.status, TaskStatus::Ready);
+            assert_eq!(task.parent_task_id, Some(parent.id));
+        }
+
+        let updated_parent = store.get_task(parent.id).unwrap();
+        assert_eq!(updated_parent.status, TaskStatus::Blocked);
+        let expected_reason = format!("split into 3 subtasks: {}, {}, {}", c1.id, c2.id, c3.id);
+        assert_eq!(
+            updated_parent.reason.as_deref(),
+            Some(expected_reason.as_str())
+        );
+    }
+
+    #[test]
+    fn apply_split_refuses_done_or_already_split_parent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let plan = SplitPlan {
+            subtasks: vec![
+                SplitSubtask {
+                    title: "Part 1".into(),
+                    body: "B1".into(),
+                    file: "file1.rs".into(),
+                },
+                SplitSubtask {
+                    title: "Part 2".into(),
+                    body: "B2".into(),
+                    file: "file2.rs".into(),
+                },
+            ],
+        };
+
+        // Parent that is done
+        let p_done = store.add_task(NewTask::default()).unwrap();
+        store.set_status(p_done.id, TaskStatus::Done).unwrap();
+        let err_done = apply_split(&mut store, p_done.id, &plan).unwrap_err();
+        assert!(matches!(err_done, SplitApplyError::Refused { .. }));
+
+        // Parent that already has children
+        let p_with_child = store.add_task(NewTask::default()).unwrap();
+        store
+            .set_status(p_with_child.id, TaskStatus::Running)
+            .unwrap();
+        let child = store
+            .add_task(NewTask {
+                parent_task_id: Some(p_with_child.id),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_task_parent(child.id, p_with_child.id).unwrap();
+
+        let err_split = apply_split(&mut store, p_with_child.id, &plan).unwrap_err();
+        assert!(matches!(err_split, SplitApplyError::Refused { .. }));
+    }
+
+    #[test]
+    fn complete_waits_for_all_children() {
+        let mut store = Store::open_in_memory().unwrap();
+        let parent = store.add_task(NewTask::default()).unwrap();
+        store.set_status(parent.id, TaskStatus::Running).unwrap();
+
+        let plan = SplitPlan {
+            subtasks: vec![
+                SplitSubtask {
+                    title: "Sub 1".into(),
+                    body: "B1".into(),
+                    file: "f1.rs".into(),
+                },
+                SplitSubtask {
+                    title: "Sub 2".into(),
+                    body: "B2".into(),
+                    file: "f2.rs".into(),
+                },
+            ],
+        };
+
+        let child_ids = apply_split(&mut store, parent.id, &plan).unwrap();
+        assert_eq!(child_ids.len(), 2);
+        assert_eq!(
+            store.get_task(parent.id).unwrap().status,
+            TaskStatus::Blocked
+        );
+
+        // Neither child is done -> nothing completed
+        let completed = complete_split_parents(&mut store).unwrap();
+        assert!(completed.is_empty());
+        assert_eq!(
+            store.get_task(parent.id).unwrap().status,
+            TaskStatus::Blocked
+        );
+
+        // Only first child is done -> still nothing completed
+        store.set_status(child_ids[0], TaskStatus::Done).unwrap();
+        let completed = complete_split_parents(&mut store).unwrap();
+        assert!(completed.is_empty());
+        assert_eq!(
+            store.get_task(parent.id).unwrap().status,
+            TaskStatus::Blocked
+        );
+
+        // Both children are done -> parent marked done
+        store.set_status(child_ids[1], TaskStatus::Done).unwrap();
+        let completed = complete_split_parents(&mut store).unwrap();
+        assert_eq!(completed, vec![parent.id]);
+        assert_eq!(store.get_task(parent.id).unwrap().status, TaskStatus::Done);
+
+        // Subsequent call doesn't touch already completed parent
+        let completed_again = complete_split_parents(&mut store).unwrap();
+        assert!(completed_again.is_empty());
+    }
+
+    #[test]
+    fn complete_ignores_non_split_blocks() {
+        let mut store = Store::open_in_memory().unwrap();
+        let t1 = store.add_task(NewTask::default()).unwrap();
+        store
+            .set_status_with_reason(t1.id, TaskStatus::Blocked, Some("manual block"))
+            .unwrap();
+
+        let t2 = store.add_task(NewTask::default()).unwrap();
+        store.set_status(t2.id, TaskStatus::Blocked).unwrap();
+
+        let t3 = store.add_task(NewTask::default()).unwrap();
+        store
+            .set_status_with_reason(
+                t3.id,
+                TaskStatus::Blocked,
+                Some("split into 2 subtasks: 99, 100"),
+            )
+            .unwrap();
+
+        let completed = complete_split_parents(&mut store).unwrap();
+        assert!(completed.is_empty());
+        assert_eq!(store.get_task(t1.id).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(store.get_task(t2.id).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(store.get_task(t3.id).unwrap().status, TaskStatus::Blocked);
     }
 }
