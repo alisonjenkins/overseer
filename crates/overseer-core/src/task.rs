@@ -30,6 +30,7 @@ pub struct NewTask {
     pub ready: bool,
     pub source: Option<String>,
     pub external_id: Option<String>,
+    pub parent_task_id: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,4 +50,5 @@ pub struct Task {
     pub reason: Option<String>,
     pub source: Option<String>,
     pub external_id: Option<String>,
+    pub parent_task_id: Option<TaskId>,
 }

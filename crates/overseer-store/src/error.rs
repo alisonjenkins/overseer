@@ -269,4 +269,18 @@ pub enum StoreError {
         #[source]
         source: Box<rusqlite::Error>,
     },
+
+    #[error("failed to list child tasks for parent {parent}")]
+    ListChildTasks {
+        parent: TaskId,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
+
+    #[error("failed to set parent of task {id}")]
+    SetTaskParent {
+        id: TaskId,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
 }

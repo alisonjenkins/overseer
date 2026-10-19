@@ -19,13 +19,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("../migrations/0005_lessons.sql")),
     (6, include_str!("../migrations/0006_reason.sql")),
     (7, include_str!("../migrations/0007_source_external_id.sql")),
+    (8, include_str!("../migrations/0008_parent_task_id.sql")),
 ];
 
 /// Settings key holding the `credits_low` mode flag, stored as `"true"` or
 /// `"false"`.
 const CREDITS_LOW_KEY: &str = "credits_low";
 
-const SELECT_TASK: &str = "SELECT id, title, body, status, priority, profile, round, approved, created_at, reason, source, external_id FROM tasks";
+const SELECT_TASK: &str = "SELECT id, title, body, status, priority, profile, round, approved, created_at, reason, source, external_id, parent_task_id FROM tasks";
 
 const SELECT_RUN: &str = "SELECT id, task_id, profile, status, started_at, finished_at, \
      input_tokens, output_tokens, failure, transcript_path, branch, skills FROM runs";
@@ -78,6 +79,7 @@ impl Store {
             ready,
             source,
             external_id,
+            parent_task_id,
         } = new;
         depends_on.sort_unstable();
         depends_on.dedup();
@@ -115,8 +117,8 @@ impl Store {
         }
 
         tx.execute(
-            "INSERT INTO tasks (title, body, status, priority, profile, round, created_at, source, external_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
+            "INSERT INTO tasks (title, body, status, priority, profile, round, created_at, source, external_id, parent_task_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9)",
             params![
                 title,
                 body,
@@ -126,6 +128,7 @@ impl Store {
                 created_at,
                 source,
                 external_id,
+                parent_task_id.map(TaskId::get),
             ],
         )
         .map_err(|source| StoreError::InsertTask {
@@ -164,6 +167,7 @@ impl Store {
             reason: None,
             source,
             external_id,
+            parent_task_id,
         })
     }
 
@@ -247,6 +251,30 @@ impl Store {
             .map_err(list_err)?;
         let mut tasks = stmt
             .query_map(params![source], task_from_row)
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Task>>>())
+            .map_err(list_err)?;
+
+        for task in &mut tasks {
+            task.depends_on = load_deps(&self.conn, task.id).map_err(list_err)?;
+        }
+        Ok(tasks)
+    }
+
+    /// List all child tasks for a given parent task, ordered by id ascending.
+    pub fn list_child_tasks(&self, parent: TaskId) -> Result<Vec<Task>, StoreError> {
+        let list_err = |err| StoreError::ListChildTasks {
+            parent,
+            source: Box::new(err),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "{SELECT_TASK} WHERE parent_task_id = ?1 ORDER BY id ASC"
+            ))
+            .map_err(list_err)?;
+        let mut tasks = stmt
+            .query_map(params![parent.get()], task_from_row)
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<Task>>>())
             .map_err(list_err)?;
 
@@ -395,6 +423,24 @@ impl Store {
             })?;
         if changed == 0 {
             return Err(StoreError::UnknownTask { id });
+        }
+        Ok(())
+    }
+
+    /// Update the parent of a child task.
+    pub fn set_task_parent(&mut self, child: TaskId, parent: TaskId) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET parent_task_id = ?1 WHERE id = ?2",
+                params![parent.get(), child.get()],
+            )
+            .map_err(|source| StoreError::SetTaskParent {
+                id: child,
+                source: Box::new(source),
+            })?;
+        if changed == 0 {
+            return Err(StoreError::UnknownTask { id: child });
         }
         Ok(())
     }
@@ -831,6 +877,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     let reason: Option<String> = row.get(9)?;
     let source: Option<String> = row.get(10)?;
     let external_id: Option<String> = row.get(11)?;
+    let parent_task_id: Option<i64> = row.get(12)?;
     Ok(Task {
         id: TaskId::new(row.get(0)?),
         title: row.get(1)?,
@@ -845,6 +892,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         reason,
         source,
         external_id,
+        parent_task_id: parent_task_id.map(TaskId::new),
     })
 }
 
@@ -972,6 +1020,7 @@ mod tests {
                 ready: false,
                 source: None,
                 external_id: None,
+                parent_task_id: None,
             })
             .unwrap();
 
@@ -986,6 +1035,7 @@ mod tests {
         assert!(task.created_at.ends_with('Z'), "{}", task.created_at);
         assert_eq!(task.source, None);
         assert_eq!(task.external_id, None);
+        assert_eq!(task.parent_task_id, None);
     }
 
     #[test]
@@ -2140,5 +2190,78 @@ mod tests {
                 ("002-feature".to_string(), 0, 1),
             ]
         );
+    }
+
+    #[test]
+    fn child_tasks_listed_in_id_order() {
+        let mut store = memory_store();
+        let parent = store.add_task(new_task("parent", 0)).unwrap();
+        let unrelated = store.add_task(new_task("unrelated", 0)).unwrap();
+
+        let child1 = store
+            .add_task(NewTask {
+                parent_task_id: Some(parent.id),
+                ..new_task("child 1", 10)
+            })
+            .unwrap();
+        let child2 = store
+            .add_task(NewTask {
+                parent_task_id: Some(parent.id),
+                ..new_task("child 2", 5)
+            })
+            .unwrap();
+        let _unrelated_child = store
+            .add_task(NewTask {
+                parent_task_id: Some(unrelated.id),
+                ..new_task("unrelated child", 0)
+            })
+            .unwrap();
+
+        let children = store.list_child_tasks(parent.id).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, child1.id);
+        assert_eq!(children[1].id, child2.id);
+
+        let unrelated_children = store.list_child_tasks(unrelated.id).unwrap();
+        assert_eq!(unrelated_children.len(), 1);
+        assert_eq!(unrelated_children[0].title, "unrelated child");
+
+        let empty = store.list_child_tasks(child1.id).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn set_task_parent_missing_task_errors() {
+        let mut store = memory_store();
+        let parent = store.add_task(new_task("parent", 0)).unwrap();
+        let err = store
+            .set_task_parent(TaskId::new(999), parent.id)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnknownTask { id } if id == TaskId::new(999)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parent_task_id_round_trips() {
+        let mut store = memory_store();
+        let task_no_parent = store.add_task(new_task("no parent", 0)).unwrap();
+        let fetched_no_parent = store.get_task(task_no_parent.id).unwrap();
+        assert_eq!(fetched_no_parent.parent_task_id, None);
+
+        let parent = store.add_task(new_task("parent", 0)).unwrap();
+        let task_with_parent = store
+            .add_task(NewTask {
+                parent_task_id: Some(parent.id),
+                ..new_task("with parent", 0)
+            })
+            .unwrap();
+        let fetched_with_parent = store.get_task(task_with_parent.id).unwrap();
+        assert_eq!(fetched_with_parent.parent_task_id, Some(parent.id));
+
+        store.set_task_parent(task_no_parent.id, parent.id).unwrap();
+        let updated = store.get_task(task_no_parent.id).unwrap();
+        assert_eq!(updated.parent_task_id, Some(parent.id));
     }
 }

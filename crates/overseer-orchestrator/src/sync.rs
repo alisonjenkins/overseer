@@ -53,6 +53,7 @@ pub fn sync_sources(
                         ready: task.ready,
                         source: Some(source_name.to_string()),
                         external_id: Some(task.external_id),
+                        parent_task_id: None,
                     })?;
                     if task.done {
                         store.set_status(created.id, TaskStatus::Done)?;

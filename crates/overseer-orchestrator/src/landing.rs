@@ -389,6 +389,7 @@ mod tests {
                 ready: true,
                 source: None,
                 external_id: None,
+                parent_task_id: None,
             })
             .unwrap()
     }

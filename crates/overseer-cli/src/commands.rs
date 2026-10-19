@@ -774,6 +774,7 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
                     ready,
                     source: None,
                     external_id: None,
+                    parent_task_id: None,
                 })
                 .context("failed to add task")?;
             tracing::info!(task_id = task.id.get(), "task added");
