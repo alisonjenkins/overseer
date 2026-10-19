@@ -12,6 +12,7 @@ mod review;
 mod router;
 mod runner;
 mod sources;
+pub mod split;
 mod sync;
 pub mod watch;
 mod worker;
@@ -44,6 +45,9 @@ pub use runner::{
     continue_task_with_backends, run_task, run_task_with_backend,
 };
 pub use sources::{SourceBuildError, SpecKitSource, build_sources};
+pub use split::{
+    SplitError, SplitPlan, SplitSubtask, build_split_prompt, parse_split, request_split,
+};
 pub use sync::{SyncError, SyncReport, sync_sources};
 pub use watch::{SourceWatcher, WatchError, start};
 pub use worker::{ShutdownSignal, WorkerError, WorkerOptions, WorkerStats, run_worker};
