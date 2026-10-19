@@ -138,11 +138,11 @@ description: "Task list for Overseer task orchestrator implementation"
 
 ## Phase 9: Task Splitting
 
-- [ ] T083 Add a migration with a nullable parent_task_id column on tasks, and store functions to set it and to list children of a task
-- [ ] T084 Add a split module that asks the local model for a JSON list of 2 to 5 subtasks, each with a title, a body and one target file path
-- [ ] T085 Validate a split result: count, one file per subtask, no subtask that names a file outside the repository, and reject the whole split on any failure
-- [ ] T086 Create child tasks in order with a dependency on the previous child, and set the parent to blocked with the reason split into N subtasks
-- [ ] T087 Trigger a split automatically when a run fails with a runaway signal (max_steps exceeded, context budget exceeded, or a server 500 after a very large input), once per task
-- [ ] T088 Add overseer task split <id> to run the same split step by hand
-- [ ] T089 Mark a split parent done when every child is done, in the same pass that reconciles merged tasks
-- [ ] T090 Test a full split end to end with a scripted local model: a runaway run is split, the children run in order, and the parent closes
+- [x] T083 Add a migration with a nullable parent_task_id column on tasks, and store functions to set it and to list children of a task
+- [x] T084 Add a split module that asks the local model for a JSON list of 2 to 5 subtasks, each with a title, a body and one target file path
+- [x] T085 Validate a split result: count, one file per subtask, no subtask that names a file outside the repository, and reject the whole split on any failure
+- [x] T086 Create child tasks in order with a dependency on the previous child, and set the parent to blocked with the reason split into N subtasks
+- [x] T087 Trigger a split automatically when a run fails with a runaway signal (max_steps exceeded, context budget exceeded, or a server 500 after a very large input), once per task
+- [x] T088 Add overseer task split <id> to run the same split step by hand
+- [x] T089 Mark a split parent done when every child is done, in the same pass that reconciles merged tasks
+- [x] T090 Test a full split end to end with a scripted local model: a runaway run is split, the children run in order, and the parent closes
