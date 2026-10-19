@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use overseer_core::{
@@ -442,6 +443,103 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::UnknownTask { id: child });
         }
+        Ok(())
+    }
+
+    /// Replace a task's dependencies.
+    pub fn set_task_deps(&mut self, id: TaskId, depends_on: &[TaskId]) -> Result<(), StoreError> {
+        let mut deps = depends_on.to_vec();
+        deps.sort_unstable();
+        deps.dedup();
+
+        for &dep in &deps {
+            if dep == id {
+                return Err(StoreError::SetTaskDepsRefused {
+                    id,
+                    reason: format!("task {id} cannot depend on itself"),
+                });
+            }
+        }
+
+        let task = self.get_task(id)?;
+        if matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::Review | TaskStatus::Done | TaskStatus::Cancelled
+        ) {
+            return Err(StoreError::SetTaskDepsRefused {
+                id,
+                reason: format!(
+                    "task {id} has status {}; only backlog, ready, blocked, or needs-human tasks can change dependencies",
+                    task.status.as_str()
+                ),
+            });
+        }
+
+        let err_fn = |err| StoreError::SetTaskDeps {
+            id,
+            source: Box::new(err),
+        };
+        let tx = self.conn.transaction().map_err(err_fn)?;
+
+        for &dep in &deps {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)",
+                    params![dep.get()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| StoreError::CheckDependency {
+                    depends_on: dep,
+                    source,
+                })?;
+            if !exists {
+                return Err(StoreError::UnknownDependency { depends_on: dep });
+            }
+        }
+
+        let mut visited = HashSet::new();
+        let mut queue: VecDeque<_> = deps.iter().copied().collect();
+        while let Some(current) = queue.pop_front() {
+            if visited.insert(current) {
+                let current_deps =
+                    load_deps(&tx, current).map_err(|source| StoreError::CheckDependency {
+                        depends_on: current,
+                        source,
+                    })?;
+                for next_dep in current_deps {
+                    if next_dep == id {
+                        return Err(StoreError::SetTaskDepsRefused {
+                            id,
+                            reason: format!(
+                                "dependency cycle detected: task {id} would depend on itself"
+                            ),
+                        });
+                    }
+                    if !visited.contains(&next_dep) {
+                        queue.push_back(next_dep);
+                    }
+                }
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM task_deps WHERE task_id = ?1",
+            params![id.get()],
+        )
+        .map_err(err_fn)?;
+
+        for &dep in &deps {
+            tx.execute(
+                "INSERT INTO task_deps (task_id, depends_on) VALUES (?1, ?2)",
+                params![id.get(), dep.get()],
+            )
+            .map_err(|source| StoreError::InsertDependency {
+                depends_on: dep,
+                source,
+            })?;
+        }
+
+        tx.commit().map_err(err_fn)?;
         Ok(())
     }
 
@@ -2263,5 +2361,87 @@ mod tests {
         store.set_task_parent(task_no_parent.id, parent.id).unwrap();
         let updated = store.get_task(task_no_parent.id).unwrap();
         assert_eq!(updated.parent_task_id, Some(parent.id));
+    }
+
+    #[test]
+    fn set_deps_replaces_list() {
+        let mut store = memory_store();
+        let a = store.add_task(new_task("a", 0)).unwrap();
+        let b = store.add_task(new_task("b", 0)).unwrap();
+        let target = store
+            .add_task(NewTask {
+                depends_on: vec![a.id],
+                ..new_task("target", 0)
+            })
+            .unwrap();
+
+        store.set_task_deps(target.id, &[b.id]).unwrap();
+        assert_eq!(store.get_task(target.id).unwrap().depends_on, vec![b.id]);
+
+        store.set_task_deps(target.id, &[]).unwrap();
+        assert!(store.get_task(target.id).unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn set_deps_refuses_running_or_done() {
+        let mut store = memory_store();
+        let a = store.add_task(new_task("a", 0)).unwrap();
+        let b = store.add_task(new_task("b", 0)).unwrap();
+        let target = store
+            .add_task(NewTask {
+                depends_on: vec![a.id],
+                ..new_task("target", 0)
+            })
+            .unwrap();
+
+        store.set_status(target.id, TaskStatus::Running).unwrap();
+        let err = store.set_task_deps(target.id, &[b.id]).unwrap_err();
+        assert!(matches!(err, StoreError::SetTaskDepsRefused { id, .. } if id == target.id));
+        assert_eq!(store.get_task(target.id).unwrap().depends_on, vec![a.id]);
+
+        store.set_status(target.id, TaskStatus::Done).unwrap();
+        let err = store.set_task_deps(target.id, &[b.id]).unwrap_err();
+        assert!(matches!(err, StoreError::SetTaskDepsRefused { id, .. } if id == target.id));
+        assert_eq!(store.get_task(target.id).unwrap().depends_on, vec![a.id]);
+    }
+
+    #[test]
+    fn set_deps_refuses_self_and_cycle() {
+        let mut store = memory_store();
+        let b = store.add_task(new_task("b", 0)).unwrap();
+        let a = store
+            .add_task(NewTask {
+                depends_on: vec![b.id],
+                ..new_task("a", 0)
+            })
+            .unwrap();
+
+        let err = store.set_task_deps(a.id, &[a.id]).unwrap_err();
+        assert!(matches!(err, StoreError::SetTaskDepsRefused { id, .. } if id == a.id));
+        assert_eq!(store.get_task(a.id).unwrap().depends_on, vec![b.id]);
+
+        let err = store.set_task_deps(b.id, &[a.id]).unwrap_err();
+        assert!(matches!(err, StoreError::SetTaskDepsRefused { id, .. } if id == b.id));
+        assert!(store.get_task(b.id).unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn set_deps_refuses_unknown_task() {
+        let mut store = memory_store();
+        let a = store.add_task(new_task("a", 0)).unwrap();
+        let target = store
+            .add_task(NewTask {
+                depends_on: vec![a.id],
+                ..new_task("target", 0)
+            })
+            .unwrap();
+
+        let missing = TaskId::new(999);
+        let err = store.set_task_deps(target.id, &[missing]).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::UnknownDependency { depends_on } if depends_on == missing
+        ));
+        assert_eq!(store.get_task(target.id).unwrap().depends_on, vec![a.id]);
     }
 }

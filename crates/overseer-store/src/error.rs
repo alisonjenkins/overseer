@@ -283,4 +283,14 @@ pub enum StoreError {
         #[source]
         source: Box<rusqlite::Error>,
     },
+
+    #[error("failed to set dependencies of task {id}")]
+    SetTaskDeps {
+        id: TaskId,
+        #[source]
+        source: Box<rusqlite::Error>,
+    },
+
+    #[error("cannot set dependencies of task {id}: {reason}")]
+    SetTaskDepsRefused { id: TaskId, reason: String },
 }
