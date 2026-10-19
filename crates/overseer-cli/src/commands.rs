@@ -894,6 +894,33 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<(), CliError> {
             tracing::info!(task_id = task.id.get(), "task cancelled");
             println!("task {id} cancelled");
         }
+        TaskCommand::Deps { id, on } => {
+            let task_id = TaskId::new(id);
+            let deps: Vec<TaskId> = on.into_iter().map(TaskId::new).collect();
+            store
+                .set_task_deps(task_id, &deps)
+                .map_err(|err| match err {
+                    overseer_store::StoreError::SetTaskDepsRefused { reason, .. } => {
+                        CliError::Refusal(reason)
+                    }
+                    other => CliError::Other(anyhow::anyhow!("{other}")),
+                })?;
+
+            let task = store
+                .get_task(task_id)
+                .with_context(|| format!("failed to find task {id}"))?;
+            if task.depends_on.is_empty() {
+                println!("task {id} has no dependencies");
+            } else {
+                let ids = task
+                    .depends_on
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("task {id} now depends on: {ids}");
+            }
+        }
     }
     Ok(())
 }

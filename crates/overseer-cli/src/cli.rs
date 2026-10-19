@@ -255,4 +255,10 @@ pub enum TaskCommand {
         /// Id of the task to cancel.
         id: i64,
     },
+    /// Replace the tasks this task waits on. Empty --on clears them.
+    Deps {
+        id: i64,
+        #[arg(long = "on", value_delimiter = ',')]
+        on: Vec<i64>,
+    },
 }
