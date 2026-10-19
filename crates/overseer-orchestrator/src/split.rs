@@ -373,6 +373,7 @@ pub enum SplitStepError {
 /// validating and applying the resulting split plan.
 pub async fn split_task(
     store: &mut Store,
+    repo: &Path,
     backend: &dyn Backend,
     profile: &Profile,
     task: &Task,
@@ -395,6 +396,16 @@ pub async fn split_task(
     }
 
     let plan = request_split(backend, profile, &task.title, &task.body).await?;
+    for subtask in &plan.subtasks {
+        let path = repo.join(&subtask.file);
+        let ok = path.is_file() || (!path.exists() && path.parent().is_some_and(|p| p.is_dir()));
+        if !ok {
+            return Err(SplitStepError::Split(SplitError::BadFile {
+                file: subtask.file.clone(),
+                reason: "no such file or directory in repository".to_owned(),
+            }));
+        }
+    }
     let child_ids = apply_split(store, task.id, &plan)?;
     tracing::info!("task {} split into {} subtasks", task.id, child_ids.len());
     Ok(child_ids)
@@ -827,12 +838,14 @@ mod tests {
             .unwrap();
         store.set_task_parent(child.id, parent.id).unwrap();
 
-        let err_parent = split_task(&mut store, &fake, &profile, &parent)
+        let repo = tempfile::tempdir().unwrap();
+
+        let err_parent = split_task(&mut store, repo.path(), &fake, &profile, &parent)
             .await
             .unwrap_err();
         assert!(matches!(err_parent, SplitStepError::Refused(_)));
 
-        let err_child = split_task(&mut store, &fake, &profile, &child)
+        let err_child = split_task(&mut store, repo.path(), &fake, &profile, &child)
             .await
             .unwrap_err();
         assert!(matches!(err_child, SplitStepError::Refused(_)));
@@ -850,6 +863,9 @@ mod tests {
             .unwrap();
         store.set_status(parent.id, TaskStatus::Ready).unwrap();
 
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+
         let fake = FakeBackend {
             output: r#"[
                 {"title": "Step 1", "body": "Do first", "file": "src/1.rs"},
@@ -860,7 +876,7 @@ mod tests {
             failure: None,
         };
 
-        let child_ids = split_task(&mut store, &fake, &test_profile(), &parent)
+        let child_ids = split_task(&mut store, repo.path(), &fake, &test_profile(), &parent)
             .await
             .unwrap();
         assert_eq!(child_ids.len(), 3);
@@ -883,5 +899,83 @@ mod tests {
         assert_eq!(children[2].id, child_ids[2]);
         assert_eq!(children[1].depends_on, vec![child_ids[0]]);
         assert_eq!(children[2].depends_on, vec![child_ids[1]]);
+    }
+
+    #[tokio::test]
+    async fn split_rejects_files_outside_repo() {
+        let mut store = Store::open_in_memory().unwrap();
+        let parent = store
+            .add_task(NewTask {
+                title: "Parent Task".into(),
+                body: "Parent Body".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_status(parent.id, TaskStatus::Ready).unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        let fake = FakeBackend {
+            output: r#"[
+                {"title": "Step 1", "body": "Do first", "file": "outside/1.rs"},
+                {"title": "Step 2", "body": "Do second", "file": "src/2.rs"}
+            ]"#
+            .into(),
+            failure: None,
+        };
+
+        let err = split_task(&mut store, repo.path(), &fake, &test_profile(), &parent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SplitStepError::Split(SplitError::BadFile { ref file, ref reason })
+                if file == "outside/1.rs" && reason == "no such file or directory in repository"
+        ));
+
+        let children = store.list_child_tasks(parent.id).unwrap();
+        assert!(children.is_empty());
+
+        let updated_parent = store.get_task(parent.id).unwrap();
+        assert_eq!(updated_parent.status, TaskStatus::Ready);
+        assert_eq!(updated_parent.reason, None);
+    }
+
+    #[tokio::test]
+    async fn split_accepts_new_file_in_existing_dir() {
+        let mut store = Store::open_in_memory().unwrap();
+        let parent = store
+            .add_task(NewTask {
+                title: "Parent Task".into(),
+                body: "Parent Body".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_status(parent.id, TaskStatus::Ready).unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/existing.rs"), "// code").unwrap();
+
+        let fake = FakeBackend {
+            output: r#"[
+                {"title": "Step 1", "body": "Do first", "file": "src/existing.rs"},
+                {"title": "Step 2", "body": "Do second", "file": "src/new.rs"}
+            ]"#
+            .into(),
+            failure: None,
+        };
+
+        let child_ids = split_task(&mut store, repo.path(), &fake, &test_profile(), &parent)
+            .await
+            .unwrap();
+        assert_eq!(child_ids.len(), 2);
+
+        let children = store.list_child_tasks(parent.id).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, child_ids[0]);
+        assert_eq!(children[1].id, child_ids[1]);
+
+        let updated_parent = store.get_task(parent.id).unwrap();
+        assert_eq!(updated_parent.status, TaskStatus::Blocked);
     }
 }

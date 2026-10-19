@@ -845,7 +845,13 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<(), CliError> {
                 .context("failed to start the async runtime")?;
 
             let child_ids = runtime
-                .block_on(split_task(&mut store, backend.as_ref(), profile, &task))
+                .block_on(split_task(
+                    &mut store,
+                    &config.repo,
+                    backend.as_ref(),
+                    profile,
+                    &task,
+                ))
                 .map_err(|err| match err {
                     SplitStepError::Refused(reason) => CliError::Refusal(reason),
                     other => CliError::Other(anyhow::anyhow!("{other}")),

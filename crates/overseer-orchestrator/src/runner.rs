@@ -538,7 +538,7 @@ async fn execute(
                 && let Some(&backend) = backends.get(last.profile.as_str())
                 && let Some(&profile) = plan.iter().find(|p| p.name == last.profile)
             {
-                match crate::split::split_task(store, backend, profile, &task).await {
+                match crate::split::split_task(store, &config.repo, backend, profile, &task).await {
                     Ok(_) => {
                         let updated = store.get_task(task_id).map_err(store_step("get task"))?;
                         return Ok(RunSummary {
@@ -1499,6 +1499,7 @@ mod tests {
     #[tokio::test]
     async fn runaway_failure_splits_task_once() {
         let mut fx = fixture();
+        std::fs::create_dir_all(fx.repo.join("src")).unwrap();
         let config = config(&fx.repo);
         let task = add(&mut fx.store, "big task", "do too much");
         let backend = RunawaySplittingBackend;
@@ -1565,6 +1566,7 @@ mod tests {
     #[tokio::test]
     async fn split_end_to_end_closes_parent() {
         let mut fx = fixture();
+        std::fs::create_dir_all(fx.repo.join("src")).unwrap();
         let mut config = config(&fx.repo);
         config.default_profile = "local-edit".to_owned();
         config.profiles = vec![profile("local-edit")];
