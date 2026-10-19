@@ -250,4 +250,9 @@ pub enum TaskCommand {
         /// Id of the task to split.
         id: i64,
     },
+    /// Cancel a task that has not started.
+    Cancel {
+        /// Id of the task to cancel.
+        id: i64,
+    },
 }

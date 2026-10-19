@@ -864,6 +864,36 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<(), CliError> {
                 .join(", ");
             println!("task {id} split into: {ids_str}");
         }
+        TaskCommand::Cancel { id } => {
+            let task_id = TaskId::new(id);
+            let task = store
+                .get_task(task_id)
+                .with_context(|| format!("failed to find task {id}"))?;
+
+            match task.status {
+                TaskStatus::Cancelled => {
+                    println!("task {id} is already cancelled");
+                    return Ok(());
+                }
+                TaskStatus::Running | TaskStatus::Review | TaskStatus::Done => {
+                    return Err(CliError::Refusal(format!(
+                        "task {id} has status {}; only unstarted tasks can be cancelled",
+                        task.status.as_str()
+                    )));
+                }
+                _ => {}
+            }
+
+            store
+                .set_status_with_reason(
+                    task_id,
+                    TaskStatus::Cancelled,
+                    Some("cancelled from the CLI"),
+                )
+                .with_context(|| format!("failed to cancel task {id}"))?;
+            tracing::info!(task_id = task.id.get(), "task cancelled");
+            println!("task {id} cancelled");
+        }
     }
     Ok(())
 }
