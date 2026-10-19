@@ -846,6 +846,40 @@ pub async fn run_review_loop_with_backends(
                 .await
                 .map_err(|source| ReviewError::Rework { source })?;
 
+                if summary.status == TaskStatus::Blocked
+                    && let Some(ref kind) = summary.failure
+                    && crate::split::is_runaway(kind)
+                {
+                    let task = store.get_task(task_id).map_err(store_step("get task"))?;
+                    if task.parent_task_id.is_none() {
+                        let children = store
+                            .list_child_tasks(task_id)
+                            .map_err(store_step("list child tasks"))?;
+                        if children.is_empty()
+                            && let Some(&backend) = backends.get(summary.profile.as_str())
+                            && let Some(profile) =
+                                config.profiles.iter().find(|p| p.name == summary.profile)
+                        {
+                            match crate::split::split_task(
+                                store,
+                                &config.repo,
+                                backend,
+                                profile,
+                                &task,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    return Ok(TaskStatus::Blocked);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(task_id = task_id.get(), %err, "split task failed");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if summary.status != TaskStatus::Review {
                     if summary.status == TaskStatus::NeedsHuman
                         && let Some(ref reason) = summary.reason
@@ -943,6 +977,7 @@ mod tests {
     struct WorkerBackend {
         file: &'static str,
         counter: AtomicUsize,
+        rework_failure: Option<FailureKind>,
     }
 
     impl WorkerBackend {
@@ -950,6 +985,15 @@ mod tests {
             Self {
                 file,
                 counter: AtomicUsize::new(0),
+                rework_failure: None,
+            }
+        }
+
+        fn with_rework_failure(file: &'static str, failure: FailureKind) -> Self {
+            Self {
+                file,
+                counter: AtomicUsize::new(0),
+                rework_failure: Some(failure),
             }
         }
     }
@@ -957,7 +1001,28 @@ mod tests {
     #[async_trait]
     impl Backend for WorkerBackend {
         async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            if req.permissions == Permissions::Read {
+                return Ok(RunOutcome {
+                    output: r#"[
+                        {"title": "Child 1", "body": "Do 1", "file": "src/a.rs"},
+                        {"title": "Child 2", "body": "Do 2", "file": "src/b.rs"},
+                        {"title": "Child 3", "body": "Do 3", "file": "src/c.rs"}
+                    ]"#
+                    .to_owned(),
+                    usage: Usage::default(),
+                    failure: None,
+                });
+            }
             let n = self.counter.fetch_add(1, Ordering::SeqCst);
+            if n > 0
+                && let Some(ref failure) = self.rework_failure
+            {
+                return Ok(RunOutcome {
+                    output: String::new(),
+                    usage: Usage::default(),
+                    failure: Some(failure.clone()),
+                });
+            }
             std::fs::write(req.workdir.join(self.file), format!("content round {n}\n")).unwrap();
             Ok(RunOutcome {
                 output: format!("wrote round {n}"),
@@ -1699,6 +1764,65 @@ mod tests {
             reason.contains("openai endpoint unreachable"),
             "expected error in reason, got {reason:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rework_runaway_splits_task() {
+        let mut fix = fixture();
+        std::fs::create_dir_all(fix.repo.join("src")).unwrap();
+        for f in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            std::fs::write(fix.repo.join(f), "//\n").unwrap();
+        }
+        crate::test_support::git_sync(&fix.repo, &["add", "src"]);
+        crate::test_support::git_sync(&fix.repo, &["commit", "-q", "-m", "add src files"]);
+
+        let task_id = add_task(&mut fix.store, "Rework runaway task");
+        let worker = WorkerBackend::with_rework_failure(
+            "work.txt",
+            FailureKind::Other("exceeded max_steps".to_owned()),
+        );
+        let rev = SequentialReviewBackend::new(vec!["VERDICT: CHANGES\n\n- Fix line 1".to_owned()]);
+
+        let mut backends: HashMap<&str, &dyn Backend> = HashMap::new();
+        backends.insert("local", &worker);
+        backends.insert("rev", &rev);
+
+        let config = Config {
+            repo: fix.repo.clone(),
+            default_profile: "local".to_owned(),
+            review: overseer_core::ReviewConfig {
+                profiles: vec!["rev".to_owned()],
+                max_reworks: 2,
+                rework_profile: None,
+            },
+            profiles: vec![test_profile("local"), test_profile("rev")],
+            learning: Default::default(),
+            escalation: Default::default(),
+            landing: Default::default(),
+            sources: Default::default(),
+            gpu: Default::default(),
+        };
+
+        run_task_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+            .await
+            .unwrap();
+
+        let status =
+            run_review_loop_with_backends(&mut fix.store, &config, &fix.state, task_id, &backends)
+                .await
+                .unwrap();
+
+        assert_eq!(status, TaskStatus::Blocked);
+        let task = fix.store.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        let reason = task.reason.as_deref().expect("expected split reason");
+        assert!(reason.starts_with("split into 3 subtasks:"), "{reason}");
+
+        let children = fix.store.list_child_tasks(task_id).unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].parent_task_id, Some(task_id));
+        assert_eq!(children[1].parent_task_id, Some(task_id));
+        assert_eq!(children[2].parent_task_id, Some(task_id));
     }
 
     #[test]
