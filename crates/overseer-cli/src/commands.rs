@@ -6,8 +6,9 @@ use overseer_core::{
     BackendKind, Config, Lesson, LessonId, LessonStatus, NewTask, Run, Task, TaskId, TaskStatus,
 };
 use overseer_orchestrator::{
-    RunSummary, ShutdownSignal, SourceBuildError, SyncError, WorkerError, WorkerLockError,
-    WorkerOptions, build_sources, check_worker_status, doctor_report, sync_sources,
+    RunSummary, ShutdownSignal, SourceBuildError, SplitStepError, SyncError, WorkerError,
+    WorkerLockError, WorkerOptions, build_sources, check_worker_status, doctor_report, split_task,
+    sync_sources,
 };
 
 use crate::cli::{
@@ -754,7 +755,7 @@ fn print_runs(runs: &[Run]) {
     }
 }
 
-fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
+fn run_task(dir: &Path, command: TaskCommand) -> Result<(), CliError> {
     let mut store = state::open_existing_store(dir)?;
     match command {
         TaskCommand::Add {
@@ -768,10 +769,10 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
             if let Some(name) = profile.as_deref() {
                 let config = state::load_config(dir)?;
                 if config.profile(name).is_none() {
-                    bail!(
+                    return Err(CliError::Refusal(format!(
                         "profile {name:?} is not defined in {}",
                         state::config_path(dir).display()
-                    );
+                    )));
                 }
             }
             let task = store
@@ -810,6 +811,52 @@ fn run_task(dir: &Path, command: TaskCommand) -> Result<()> {
                 .list_reviews(task_id)
                 .with_context(|| format!("failed to list reviews for task {id}"))?;
             print_task(&task, &reviews);
+        }
+        TaskCommand::Split { id } => {
+            let config = state::load_config(dir)?;
+            let task_id = TaskId::new(id);
+            let task = store
+                .get_task(task_id)
+                .with_context(|| format!("failed to find task {id}"))?;
+
+            match task.status {
+                TaskStatus::Backlog | TaskStatus::Ready | TaskStatus::Blocked => {}
+                other => {
+                    return Err(CliError::Refusal(format!(
+                        "task {id} has status {}; only backlog, ready, or blocked tasks can be split",
+                        other.as_str()
+                    )));
+                }
+            }
+
+            let profile_name = task.profile.as_deref().unwrap_or(&config.default_profile);
+            let profile = config.profile(profile_name).ok_or_else(|| {
+                CliError::Refusal(format!(
+                    "profile {profile_name:?} for task {id} is not defined in overseer.toml"
+                ))
+            })?;
+            let backend = overseer_backends::build_backend(profile).map_err(|err| {
+                CliError::Other(anyhow::Error::from(err).context("failed to build backend"))
+            })?;
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to start the async runtime")?;
+
+            let child_ids = runtime
+                .block_on(split_task(&mut store, backend.as_ref(), profile, &task))
+                .map_err(|err| match err {
+                    SplitStepError::Refused(reason) => CliError::Refusal(reason),
+                    other => CliError::Other(anyhow::anyhow!("{other}")),
+                })?;
+
+            let ids_str = child_ids
+                .iter()
+                .map(|cid| cid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("task {id} split into: {ids_str}");
         }
     }
     Ok(())

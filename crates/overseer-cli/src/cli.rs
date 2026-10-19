@@ -245,4 +245,9 @@ pub enum TaskCommand {
     },
     /// Show one task in full.
     Show { id: i64 },
+    /// Split a task into subtasks.
+    Split {
+        /// Id of the task to split.
+        id: i64,
+    },
 }
