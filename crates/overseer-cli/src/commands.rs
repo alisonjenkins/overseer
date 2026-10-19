@@ -218,6 +218,16 @@ fn reconcile(store: &mut overseer_store::Store, repo: &Path) -> Result<()> {
             println!("task {}: branch already on HEAD, marked done", task.id);
         }
     }
+    match overseer_orchestrator::complete_split_parents(store) {
+        Ok(completed) => {
+            for id in completed {
+                println!("task {id}: all subtasks done, marked done");
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: failed to complete split parents: {err:#}");
+        }
+    }
     Ok(())
 }
 
