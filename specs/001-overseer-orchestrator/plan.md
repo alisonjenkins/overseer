@@ -353,3 +353,25 @@ The review prompt puts whole file contents into the reviewer context with no bud
 
 The HTTP API in phase 7 (T063) is replaced by `overseer-web` (see tasks T079 and T080).
 
+## Task Splitting
+
+### Trigger
+A run that fails with a runaway signal (`max_steps` exceeded, a context budget failure, or a server 500 after a very large input) asks the split step to break the task up. A manual `overseer task split <id>` runs the same step.
+
+### Split Step
+One call to the local model returns a JSON list of 2 to 5 subtasks, each with a title, a body, and exactly one target file path. The list is validated before anything is created; an invalid list is rejected and the parent stays as it was.
+
+### Children
+Each subtask is a task. Child N depends on child N-1, so the worker runs them in order. The parent becomes `blocked` with reason `split into N subtasks: <ids>`.
+
+### Completion
+When every child is `done`, the parent becomes `done` on the next status or worker start (the same reconcile pass that closes merged tasks).
+
+### Guardrails
+A task can be split once; children cannot split again. Children go through review, tests, and landing like any other task. Splitting uses one bounded model call and cannot loop.
+
+### Storage
+A nullable `parent_task_id` column on tasks.
+
+### Decision Recorded
+Splitting is automatic on runaway failures. Parent completion is automatic.
