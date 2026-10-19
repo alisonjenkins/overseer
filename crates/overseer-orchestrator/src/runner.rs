@@ -1519,4 +1519,117 @@ mod tests {
         assert_eq!(children[1].parent_task_id, Some(task));
         assert_eq!(children[2].parent_task_id, Some(task));
     }
+
+    struct SplitE2eBackend;
+
+    #[async_trait]
+    impl Backend for SplitE2eBackend {
+        async fn run(&self, req: &RunRequest) -> Result<RunOutcome, BackendError> {
+            if req.permissions == Permissions::Read {
+                Ok(RunOutcome {
+                    output: r#"[
+                        {"title": "Child 1", "body": "Write a", "file": "src/a.rs"},
+                        {"title": "Child 2", "body": "Write b", "file": "src/b.rs"},
+                        {"title": "Child 3", "body": "Write c", "file": "src/c.rs"}
+                    ]"#
+                    .to_owned(),
+                    usage: Usage::default(),
+                    failure: None,
+                })
+            } else {
+                let file = ["src/a.rs", "src/b.rs", "src/c.rs"]
+                    .into_iter()
+                    .find(|f| req.prompt.contains(f));
+                if let Some(file) = file {
+                    let path = req.workdir.join(file);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    std::fs::write(&path, "// code\n").unwrap();
+                    Ok(RunOutcome {
+                        output: format!("wrote {file}"),
+                        usage: Usage::default(),
+                        failure: None,
+                    })
+                } else {
+                    Ok(RunOutcome {
+                        output: String::new(),
+                        usage: Usage::default(),
+                        failure: Some(FailureKind::Other("exceeded max_steps".to_owned())),
+                    })
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_end_to_end_closes_parent() {
+        let mut fx = fixture();
+        let mut config = config(&fx.repo);
+        config.default_profile = "local-edit".to_owned();
+        config.profiles = vec![profile("local-edit")];
+
+        let parent_id = fx
+            .store
+            .add_task(NewTask {
+                title: "parent task".to_owned(),
+                body: "needs splitting".to_owned(),
+                profile: Some("local-edit".to_owned()),
+                ..NewTask::default()
+            })
+            .unwrap()
+            .id;
+
+        let backend = SplitE2eBackend;
+
+        let summary = run_task_with_backend(&mut fx.store, &config, &fx.state, parent_id, &backend)
+            .await
+            .unwrap();
+        assert_eq!(summary.status, TaskStatus::Blocked);
+        let parent = fx.store.get_task(parent_id).unwrap();
+        assert_eq!(parent.status, TaskStatus::Blocked);
+        let reason = parent.reason.expect("split reason should be set");
+        assert!(reason.starts_with("split into 3 subtasks:"), "{reason}");
+
+        let children = fx.store.list_child_tasks(parent_id).unwrap();
+        assert_eq!(children.len(), 3);
+        for child in &children {
+            assert_eq!(child.parent_task_id, Some(parent_id));
+        }
+        let child_ids: Vec<TaskId> = children.iter().map(|c| c.id).collect();
+
+        let mut executed_order = Vec::new();
+        while let Some(ready) = fx.store.pick_next_ready_task().unwrap() {
+            executed_order.push(ready.id);
+            let child_summary =
+                run_task_with_backend(&mut fx.store, &config, &fx.state, ready.id, &backend)
+                    .await
+                    .unwrap();
+            assert_eq!(child_summary.status, TaskStatus::Review);
+            assert_eq!(fx.store.pick_next_ready_task().unwrap(), None);
+            fx.store.set_status(ready.id, TaskStatus::Done).unwrap();
+        }
+        assert_eq!(executed_order, child_ids);
+        assert_eq!(fx.store.pick_next_ready_task().unwrap(), None);
+
+        let completed = crate::split::complete_split_parents(&mut fx.store).unwrap();
+        assert_eq!(completed, vec![parent_id]);
+        assert_eq!(
+            fx.store.get_task(parent_id).unwrap().status,
+            TaskStatus::Done
+        );
+
+        fx.store.set_status(parent_id, TaskStatus::Ready).unwrap();
+        let second_summary =
+            run_task_with_backend(&mut fx.store, &config, &fx.state, parent_id, &backend)
+                .await
+                .unwrap();
+        assert_eq!(second_summary.status, TaskStatus::Blocked);
+        let children_after = fx.store.list_child_tasks(parent_id).unwrap();
+        assert_eq!(children_after.len(), 3);
+        assert_eq!(
+            children_after.iter().map(|c| c.id).collect::<Vec<_>>(),
+            child_ids
+        );
+    }
 }
