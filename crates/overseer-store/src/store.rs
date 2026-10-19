@@ -549,7 +549,7 @@ impl Store {
         let changed = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'ready' \
+                "UPDATE tasks SET status = 'ready', reason = NULL \
                  WHERE id = ?1 AND status IN ('backlog', 'blocked')",
                 params![id.get()],
             )
@@ -1367,6 +1367,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ready_task_clears_block_reason() {
+        let mut store = memory_store();
+        let task = store.add_task(new_task("blocked", 0)).unwrap();
+        store
+            .set_status_with_reason(
+                task.id,
+                TaskStatus::Blocked,
+                Some("split into 2 subtasks: 1, 2"),
+            )
+            .unwrap();
+        let readied = store.ready_task(task.id).unwrap();
+        assert_eq!(readied.status, TaskStatus::Ready);
+        assert_eq!(readied.reason, None);
+        let fetched = store.get_task(task.id).unwrap();
+        assert_eq!(fetched.status, TaskStatus::Ready);
+        assert_eq!(fetched.reason, None);
     }
 
     #[test]
