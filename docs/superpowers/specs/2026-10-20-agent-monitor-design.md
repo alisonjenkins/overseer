@@ -278,8 +278,9 @@ no login of its own.
 
 - Collectors: secret-scrubbed recorded fixtures from each source, run through
   the collector and diffed against expected NDJSON.
-- Projection: property tests that `fold` is deterministic for a given `seq`
-  order and that duplicate events do not change state.
+- Projection: table-driven tests per transition, and a replay test that
+  folding the same event sequence twice gives the same state. Duplicates are
+  excluded by the store's unique `id`, so `fold` does not deduplicate.
 - Store: one conformance suite run against SQLite and an ephemeral Postgres
   from the Nix dev shell.
 - End to end: `cat fixtures | ovs ship` into `ovs serve` (SQLite), read back
