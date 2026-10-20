@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use ovs_event::{
-    ActivityState, Body, CallId, Event, Host, SessionKey, Snippet, Source, Timestamp, Usage,
+    ActivityState, Body, CallId, Event, Host, PromptBy, SessionKey, Snippet, Source, Timestamp,
+    Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,9 +99,17 @@ impl SessionState {
             .any(|call| QUESTION_TOOLS.contains(&call.name.as_str()))
     }
 
+    fn active_state(&self) -> State {
+        if self.has_open_question() {
+            State::WaitingInput
+        } else {
+            State::Working
+        }
+    }
+
     fn state_for(&self, reported: ActivityState) -> State {
         match reported {
-            ActivityState::Working => State::Working,
+            ActivityState::Working => self.active_state(),
             ActivityState::Idle if self.has_open_question() => State::WaitingInput,
             ActivityState::Idle => State::Idle,
             ActivityState::WaitingInput => State::WaitingInput,
@@ -126,14 +135,20 @@ pub fn fold(prev: Option<SessionState>, event: &Event) -> Option<SessionState> {
             s.title = start.title.clone().or(s.title.take());
             s.model = start.model.clone().or(s.model.take());
         }
-        Body::SessionEnded { .. } => s.state = State::Ended,
+        Body::SessionEnded { .. } => {
+            s.open_calls.clear();
+            s.state = State::Ended;
+        }
         Body::SessionStatus { state } => s.state = s.state_for(*state),
-        Body::Prompt { text, .. } => {
-            s.state = State::Working;
+        Body::Prompt { text, by } => {
+            if matches!(by, PromptBy::User) {
+                s.open_calls.clear();
+            }
+            s.state = s.active_state();
             s.activity = Some(text.clone());
         }
         Body::Message { text, model } => {
-            s.state = State::Working;
+            s.state = s.active_state();
             s.activity = Some(text.clone());
             if model.is_some() {
                 s.model = model.clone();
@@ -152,19 +167,11 @@ pub fn fold(prev: Option<SessionState>, event: &Event) -> Option<SessionState> {
                 },
             );
             s.activity = Some(Snippet::new(&format!("{name}: {}", input.as_str())));
-            s.state = if QUESTION_TOOLS.contains(&name.as_str()) {
-                State::WaitingInput
-            } else {
-                State::Working
-            };
+            s.state = s.active_state();
         }
         Body::ToolResult { call_id, .. } => {
             s.open_calls.remove(call_id);
-            s.state = if s.has_open_question() {
-                State::WaitingInput
-            } else {
-                State::Working
-            };
+            s.state = s.active_state();
         }
         Body::Usage(usage) => {
             s.usage.add(usage);
@@ -404,6 +411,76 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn user_prompt_abandons_open_question() {
+        let events = [
+            ev("s1", 1_000, called("q1", "AskUserQuestion")),
+            ev("s1", 2_000, prompt("never mind")),
+            ev(
+                "s1",
+                3_000,
+                Body::SessionStatus {
+                    state: ActivityState::Idle,
+                },
+            ),
+        ];
+        let s = apply_all(&events)
+            .remove(&SessionKey::new(Source::ClaudeCode, "s1"))
+            .unwrap();
+        assert_eq!(s.state, State::Idle);
+        assert!(s.open_calls.is_empty());
+    }
+
+    #[test]
+    fn session_end_clears_open_calls() {
+        let events = [
+            ev("s1", 1_000, called("t1", "Bash")),
+            ev(
+                "s1",
+                2_000,
+                Body::SessionEnded {
+                    reason: EndReason::Exited,
+                },
+            ),
+        ];
+        let s = apply_all(&events)
+            .remove(&SessionKey::new(Source::ClaudeCode, "s1"))
+            .unwrap();
+        assert!(s.open_calls.is_empty());
+        assert_eq!(s.state, State::Ended);
+    }
+
+    #[test]
+    fn activity_keeps_open_question_visible() {
+        let s = fold(None, &ev("s1", 1_000, called("q1", "AskUserQuestion"))).unwrap();
+        assert_eq!(s.state, State::WaitingInput);
+        let s = fold(Some(s), &ev("s1", 2_000, called("t2", "Bash"))).unwrap();
+        assert_eq!(s.state, State::WaitingInput);
+        let s = fold(
+            Some(s),
+            &ev(
+                "s1",
+                3_000,
+                Body::Message {
+                    text: Snippet::new("working on it"),
+                    model: None,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(s.state, State::WaitingInput);
+        let s = fold(Some(s), &ev("s1", 4_000, result("t2"))).unwrap();
+        assert_eq!(s.state, State::WaitingInput);
+        let s = fold(Some(s), &ev("s1", 5_000, result("q1"))).unwrap();
+        assert_eq!(s.state, State::Working);
+    }
+
+    #[test]
+    fn opencode_question_tool_waits_for_input() {
+        let s = fold(None, &ev("s1", 1_000, called("q1", "question"))).unwrap();
+        assert_eq!(s.state, State::WaitingInput);
     }
 
     #[test]
