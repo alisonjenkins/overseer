@@ -99,3 +99,17 @@ fn rejects_a_bad_since() {
         .failure()
         .stderr(predicates::str::contains("--since is not an RFC 3339 time"));
 }
+
+#[test]
+fn rejects_a_zero_poll_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("ovs")
+        .unwrap()
+        .args(["collect", "claude", "--once", "--interval-ms", "0"])
+        .arg("--root")
+        .arg(dir.path())
+        .arg("--cursor")
+        .arg(dir.path().join("c.json"))
+        .assert()
+        .failure();
+}

@@ -45,7 +45,7 @@ struct ClaudeArgs {
     #[arg(long, env = "OVS_HOST")]
     host: Option<String>,
     /// Milliseconds between polls.
-    #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
+    #[arg(long, default_value_t = DEFAULT_INTERVAL_MS, value_parser = clap::value_parser!(u64).range(1..))]
     interval_ms: u64,
     /// Poll once and exit.
     #[arg(long)]
@@ -57,7 +57,10 @@ struct ClaudeArgs {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("OVS_LOG"))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("OVS_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .with_writer(io::stderr)
         .init();
     match Cli::parse().command {
