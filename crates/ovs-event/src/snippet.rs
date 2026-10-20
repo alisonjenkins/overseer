@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SNIPPET_MAX_BYTES: usize = 2048;
 const ELLIPSIS: char = '…';
+const REDACTED: &str = "[redacted]";
 
 struct Rule {
     pattern: &'static str,
@@ -61,7 +62,7 @@ pub struct Snippet(String);
 
 impl Snippet {
     pub fn new(raw: &str) -> Self {
-        Self(truncate(&redact(raw)))
+        Self(truncate(&apply_policy(raw, &COMPILED, RULES.len())))
     }
 
     pub fn as_str(&self) -> &str {
@@ -81,10 +82,13 @@ impl From<Snippet> for String {
     }
 }
 
-fn redact(text: &str) -> String {
-    COMPILED
+fn apply_policy(raw: &str, compiled: &[(Regex, &'static str)], expected_rules: usize) -> String {
+    if compiled.len() != expected_rules {
+        return REDACTED.to_owned();
+    }
+    compiled
         .iter()
-        .fold(text.to_owned(), |acc, (re, replacement)| {
+        .fold(raw.to_owned(), |acc, (re, replacement)| {
             re.replace_all(&acc, *replacement).into_owned()
         })
 }
@@ -111,6 +115,16 @@ mod tests {
     #[test]
     fn every_rule_compiles() {
         assert_eq!(COMPILED.len(), RULES.len());
+    }
+
+    #[test]
+    fn missing_rule_redacts_everything() {
+        let result = apply_policy(
+            "API_KEY=abc plain text",
+            COMPILED.get(..1).unwrap_or_default(),
+            RULES.len(),
+        );
+        assert_eq!(result, REDACTED);
     }
 
     #[test]
