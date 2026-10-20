@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,6 +17,7 @@ use crate::registry::{RegistryError, diff_registry, read_registry};
 pub struct PollStats {
     pub events: usize,
     pub parse_errors: usize,
+    pub read_errors: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +58,16 @@ pub enum CollectError {
     Registry(#[from] RegistryError),
 }
 
+impl CollectError {
+    fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Open { source, .. } | Self::Read { source, .. }
+                if source.kind() == io::ErrorKind::NotFound
+        )
+    }
+}
+
 struct Transcript {
     path: PathBuf,
     native: String,
@@ -69,6 +81,7 @@ pub struct Collector {
     cursor_path: PathBuf,
     since: Option<SystemTime>,
     cursor: Cursor,
+    reported: HashSet<PathBuf>,
 }
 
 impl Collector {
@@ -85,6 +98,7 @@ impl Collector {
             cursor_path,
             since,
             cursor,
+            reported: HashSet::new(),
         })
     }
 
@@ -95,15 +109,44 @@ impl Collector {
     ) -> Result<PollStats, CollectError> {
         let mut stats = PollStats::default();
         let mut cursor = self.cursor.clone();
-        for transcript in discover(&self.root.join("projects"))? {
-            if !cursor.files.contains_key(&transcript.path)
-                && self.older_than_since(&transcript.path)?
-            {
-                continue;
+        let mut reported = self.reported.clone();
+        let discovered = discover(&self.root.join("projects"))?;
+        let known: HashSet<PathBuf> = discovered.iter().map(|t| t.path.clone()).collect();
+        cursor.files.retain(|path, _| known.contains(path));
+        reported.retain(|path| known.contains(path));
+        for transcript in discovered {
+            match self.read_transcript(&transcript, &mut cursor, &mut stats) {
+                Ok(events) => {
+                    reported.remove(&transcript.path);
+                    write_events(out, &events)?;
+                }
+                Err(err) if err.is_not_found() => {
+                    tracing::debug!(
+                        path = %transcript.path.display(),
+                        error = %err,
+                        "transcript vanished before it was read"
+                    );
+                    cursor.files.remove(&transcript.path);
+                    reported.remove(&transcript.path);
+                }
+                Err(err) => {
+                    stats.read_errors = stats.read_errors.saturating_add(1);
+                    tracing::warn!(
+                        path = %transcript.path.display(),
+                        error = %err,
+                        "skipping unreadable transcript"
+                    );
+                    if reported.insert(transcript.path.clone()) {
+                        let offset = cursor
+                            .files
+                            .get(&transcript.path)
+                            .map_or(0, |file| file.offset);
+                        let event = read_error_event(&self.host, &transcript, offset, &err);
+                        stats.events = stats.events.saturating_add(1);
+                        write_events(out, &[event])?;
+                    }
+                }
             }
-            let file = cursor.files.entry(transcript.path.clone()).or_default();
-            let events = read_new_lines(&self.host, &transcript, file, &mut stats)?;
-            write_events(out, &events)?;
         }
         let live = read_registry(&self.root.join("sessions"))?;
         let (events, next) =
@@ -115,7 +158,23 @@ impl Collector {
             .map_err(|source| CollectError::Write { source })?;
         cursor.save(&self.cursor_path)?;
         self.cursor = cursor;
+        self.reported = reported;
         Ok(stats)
+    }
+
+    fn read_transcript(
+        &self,
+        transcript: &Transcript,
+        cursor: &mut Cursor,
+        stats: &mut PollStats,
+    ) -> Result<Vec<Event>, CollectError> {
+        if !cursor.files.contains_key(&transcript.path)
+            && self.older_than_since(&transcript.path)?
+        {
+            return Ok(Vec::new());
+        }
+        let file = cursor.files.entry(transcript.path.clone()).or_default();
+        read_new_lines(&self.host, transcript, file, stats)
     }
 
     fn older_than_since(&self, path: &Path) -> Result<bool, CollectError> {
@@ -275,6 +334,39 @@ fn read_new_lines(
     Ok(events)
 }
 
+fn read_error_event(
+    host: &Host,
+    transcript: &Transcript,
+    offset: u64,
+    err: &CollectError,
+) -> Event {
+    let path = transcript.path.to_string_lossy();
+    let ctx = LineContext {
+        host,
+        native_session: &transcript.native,
+        session: &transcript.session,
+        parent: transcript.parent.as_ref(),
+        path: &path,
+        offset,
+    };
+    let body = Body::Error {
+        class: ErrorClass::Other,
+        message: Snippet::new(&err_with_sources(err)),
+    };
+    build(&ctx, Timestamp::now(), format!("{offset}:read-error"), body)
+}
+
+fn err_with_sources(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 fn write_events(out: &mut impl Write, events: &[Event]) -> Result<(), CollectError> {
     for event in events {
         let line = event
@@ -295,6 +387,7 @@ mod tests {
     )]
 
     use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime};
 
     use ovs_event::{Body, ErrorClass, Event, Host};
@@ -458,5 +551,60 @@ mod tests {
             .map(|e| e.body.kind())
             .collect();
         assert_eq!(kinds, ["session.started", "prompt"]);
+    }
+
+    #[test]
+    fn unreadable_transcript_is_reported_once_and_others_continue() {
+        let env = Env::new();
+        let project = env.dir.path().join("claude/projects/-tmp-proj");
+        let a = project.join("a.jsonl");
+        let b = project.join("b.jsonl");
+        env.append(&a, &format!("{LINE}\n"));
+        env.append(&b, &format!("{LINE}\n"));
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut collector = env.collector(None);
+        let mut out = Vec::new();
+        let stats = collector.poll(&mut out, |_| true).unwrap();
+        let events: Vec<Event> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| Event::from_line(l).unwrap())
+            .collect();
+        let errors: Vec<&Event> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.body,
+                    Body::Error {
+                        class: ErrorClass::Other,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].session.as_str(), "claude-code:a");
+        let b_kinds: Vec<_> = events
+            .iter()
+            .filter(|e| e.session.as_str() == "claude-code:b")
+            .map(|e| e.body.kind())
+            .collect();
+        assert_eq!(b_kinds, ["session.started", "prompt"]);
+        assert_eq!(events.len(), 3);
+        assert_eq!(stats.read_errors, 1);
+        assert!(env.poll(&mut collector).is_empty());
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn deleted_transcripts_leave_the_cursor() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        assert_eq!(env.poll(&mut env.collector(None)).len(), 2);
+        fs::remove_file(env.transcript()).unwrap();
+        let mut collector = env.collector(None);
+        assert!(env.poll(&mut collector).is_empty());
+        let cursor = Cursor::load(&env.dir.path().join("state/cursor.json")).unwrap();
+        assert!(cursor.files.is_empty());
     }
 }
