@@ -47,6 +47,23 @@ Add the input and apply `overlays.default`:
 }
 ```
 
+## Agent monitor (`ovs`)
+
+`ovs` is the start of overseer's redesign into small commands joined by one
+NDJSON event stream (ADR 0011, design in
+`docs/superpowers/specs/2026-10-20-agent-monitor-design.md`). Today it has one
+subcommand:
+
+```sh
+ovs collect claude --once | jq -c '{session, kind}'
+ovs collect claude --since 2026-10-20T00:00:00Z     # follow, skipping old transcripts
+```
+
+It reads `~/.claude/projects/**.jsonl` and `~/.claude/sessions/*.json`, prints
+one event per line on stdout, and keeps its position in
+`$XDG_STATE_HOME/ovs/collect-claude.json`, so a restart continues where it
+stopped. Set `OVS_LOG=debug` to see per-poll counts on stderr.
+
 ## Build and test
 
 The toolchain comes from the Nix dev shell. Run cargo through it:

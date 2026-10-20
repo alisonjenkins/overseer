@@ -34,7 +34,7 @@
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "-p" "overseer-cli" ];
+            cargoBuildFlags = [ "-p" "overseer-cli" "-p" "ovs-cli" ];
             nativeCheckInputs = [ pkgs.git ];
             doCheck = true;
             preCheck = ''

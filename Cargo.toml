@@ -9,6 +9,7 @@ members = [
     "crates/ovs-event",
     "crates/ovs-state",
     "crates/ovs-collect-claude",
+    "crates/ovs-cli",
 ]
 
 [workspace.package]
