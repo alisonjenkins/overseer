@@ -34,7 +34,8 @@ read side exists.
 
 - Sources in v1: Claude Code (interactive and subagents), opencode (including
   `delegate-to-local` agent runs), agy.
-- Several machines report to one central view over the tailnet.
+- Several machines report to one central view over the tailnet. The central
+  host (`ovs serve`) is ali-desktop.
 - Live view, history with search, token and cost accounting, attention alerts.
 - Alerts to ntfy, desktop (`notify-send`) and the web UI, through a pluggable
   notifier.
@@ -301,8 +302,6 @@ Each ends usable and leaves `cargo test` and `nix build` green.
 
 ## 11. Open points
 
-- Which machine is the central host. It is configuration, not design, and is
-  needed by milestone 6.
 - agy permission waits stay heuristic until its step protobuf can be decoded.
 - The opencode DB was last written 2026-10-07 while agent runs continued to
   2026-10-18; milestone 4 confirms where current opencode versions write.
