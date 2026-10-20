@@ -94,34 +94,27 @@ impl Collector {
         is_alive: impl Fn(u32) -> bool,
     ) -> Result<PollStats, CollectError> {
         let mut stats = PollStats::default();
+        let mut cursor = self.cursor.clone();
         for transcript in discover(&self.root.join("projects"))? {
-            if !self.cursor.files.contains_key(&transcript.path)
+            if !cursor.files.contains_key(&transcript.path)
                 && self.older_than_since(&transcript.path)?
             {
                 continue;
             }
-            let file = self
-                .cursor
-                .files
-                .entry(transcript.path.clone())
-                .or_default();
+            let file = cursor.files.entry(transcript.path.clone()).or_default();
             let events = read_new_lines(&self.host, &transcript, file, &mut stats)?;
             write_events(out, &events)?;
         }
         let live = read_registry(&self.root.join("sessions"))?;
-        let (events, next) = diff_registry(
-            &self.host,
-            &self.cursor.live,
-            &live,
-            is_alive,
-            Timestamp::now(),
-        );
+        let (events, next) =
+            diff_registry(&self.host, &cursor.live, &live, is_alive, Timestamp::now());
         write_events(out, &events)?;
         stats.events = stats.events.saturating_add(events.len());
-        self.cursor.live = next;
+        cursor.live = next;
         out.flush()
             .map_err(|source| CollectError::Write { source })?;
-        self.cursor.save(&self.cursor_path)?;
+        cursor.save(&self.cursor_path)?;
+        self.cursor = cursor;
         Ok(stats)
     }
 
@@ -439,5 +432,31 @@ mod tests {
         env.append(&env.transcript(), &format!("{LINE}\n"));
         let future = SystemTime::now() + Duration::from_secs(3600);
         assert!(env.poll(&mut env.collector(Some(future))).is_empty());
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_write_leaves_lines_for_the_next_poll() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        let mut collector = env.collector(None);
+        assert!(collector.poll(&mut FailingWriter, |_| true).is_err());
+        let kinds: Vec<_> = env
+            .poll(&mut collector)
+            .iter()
+            .map(|e| e.body.kind())
+            .collect();
+        assert_eq!(kinds, ["session.started", "prompt"]);
     }
 }

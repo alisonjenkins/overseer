@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{FileState, LiveEntry};
 
 /// Everything the collector needs to resume after a restart.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Cursor {
     #[serde(default)]
     pub files: BTreeMap<PathBuf, FileState>,
