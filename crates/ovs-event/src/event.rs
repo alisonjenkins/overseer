@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{Body, EventId, Timestamp};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Source {
@@ -117,9 +119,54 @@ impl From<SchemaVersion> for u8 {
     }
 }
 
+/// One line of the event stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub v: SchemaVersion,
+    pub id: EventId,
+    pub ts: Timestamp,
+    pub host: Host,
+    pub source: Source,
+    pub session: SessionKey,
+    pub parent: Option<SessionKey>,
+    #[serde(flatten)]
+    pub body: Body,
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<SourceRef>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EventError {
+    #[error("failed to encode event")]
+    Encode {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to decode event")]
+    Decode {
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl Event {
+    pub fn to_line(&self) -> Result<String, EventError> {
+        serde_json::to_string(self).map_err(|source| EventError::Encode { source })
+    }
+
+    pub fn from_line(line: &str) -> Result<Self, EventError> {
+        serde_json::from_str(line).map_err(|source| EventError::Decode { source })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::unreachable
+    )]
 
     use super::*;
 
@@ -153,5 +200,51 @@ mod tests {
         assert!(serde_json::from_str::<SchemaVersion>("1").is_ok());
         let err = serde_json::from_str::<SchemaVersion>("2").unwrap_err();
         assert!(err.to_string().contains("unsupported schema version 2"));
+    }
+
+    const SPEC_EXAMPLE: &str = r#"{"v":1,"id":"0123456789abcdef0123456789abcdef","ts":"2026-10-20T05:33:12.123Z","host":"ali-desktop","source":"claude-code","session":"claude-code:6b3bd7d6","parent":null,"kind":"tool.called","data":{"call_id":"toolu_01","name":"Bash","input":"cargo test"}}"#;
+
+    #[test]
+    fn spec_example_round_trips_byte_for_byte() {
+        let event = Event::from_line(SPEC_EXAMPLE).unwrap();
+        assert_eq!(event.body.kind(), "tool.called");
+        assert_eq!(event.to_line().unwrap(), SPEC_EXAMPLE);
+    }
+
+    #[test]
+    fn ref_is_written_only_when_present() {
+        let mut event = Event::from_line(SPEC_EXAMPLE).unwrap();
+        event.source_ref = Some(SourceRef {
+            host: Host::new("ali-desktop"),
+            path: "/home/ali/.claude/projects/p/s.jsonl".to_owned(),
+            offset: 42,
+        });
+        let line = event.to_line().unwrap();
+        assert!(line.ends_with(r#""ref":{"host":"ali-desktop","path":"/home/ali/.claude/projects/p/s.jsonl","offset":42}}"#));
+        assert_eq!(Event::from_line(&line).unwrap(), event);
+    }
+
+    #[test]
+    fn unknown_kind_is_rejected() {
+        let line = SPEC_EXAMPLE.replace("tool.called", "tool.exploded");
+        assert!(Event::from_line(&line).is_err());
+    }
+
+    #[test]
+    fn other_schema_versions_are_rejected() {
+        let line = SPEC_EXAMPLE.replace(r#""v":1"#, r#""v":2"#);
+        let err = Event::from_line(&line).unwrap_err();
+        let cause = std::error::Error::source(&err).unwrap().to_string();
+        assert!(cause.contains("unsupported schema version 2"), "{cause}");
+    }
+
+    #[test]
+    fn decoded_text_obeys_the_snippet_policy() {
+        let line = SPEC_EXAMPLE.replace("cargo test", &"a".repeat(3000));
+        let event = Event::from_line(&line).unwrap();
+        let Body::ToolCalled { input, .. } = event.body else {
+            unreachable!("fixture is a tool.called event")
+        };
+        assert!(input.as_str().len() <= crate::SNIPPET_MAX_BYTES);
     }
 }
