@@ -1,0 +1,442 @@
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use ovs_event::{
+    Body, ErrorClass, Event, EventError, Host, SessionKey, Snippet, Source, Timestamp,
+};
+
+use crate::cursor::{Cursor, CursorError};
+use crate::record::{FileState, LineContext, build, parse_line};
+use crate::registry::{RegistryError, diff_registry, read_registry};
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PollStats {
+    pub events: usize,
+    pub parse_errors: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CollectError {
+    #[error("cannot list {path}")]
+    Discover {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("cannot open transcript {path}")]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("cannot read transcript {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("transcript {path} offset overflowed u64")]
+    OffsetOverflow { path: PathBuf },
+    #[error("cannot encode event")]
+    Encode {
+        #[source]
+        source: EventError,
+    },
+    #[error("cannot write events")]
+    Write {
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Cursor(#[from] CursorError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
+
+struct Transcript {
+    path: PathBuf,
+    native: String,
+    session: SessionKey,
+    parent: Option<SessionKey>,
+}
+
+pub struct Collector {
+    root: PathBuf,
+    host: Host,
+    cursor_path: PathBuf,
+    since: Option<SystemTime>,
+    cursor: Cursor,
+}
+
+impl Collector {
+    pub fn open(
+        root: PathBuf,
+        host: Host,
+        cursor_path: PathBuf,
+        since: Option<SystemTime>,
+    ) -> Result<Self, CollectError> {
+        let cursor = Cursor::load(&cursor_path)?;
+        Ok(Self {
+            root,
+            host,
+            cursor_path,
+            since,
+            cursor,
+        })
+    }
+
+    pub fn poll(
+        &mut self,
+        out: &mut impl Write,
+        is_alive: impl Fn(u32) -> bool,
+    ) -> Result<PollStats, CollectError> {
+        let mut stats = PollStats::default();
+        for transcript in discover(&self.root.join("projects"))? {
+            if !self.cursor.files.contains_key(&transcript.path)
+                && self.older_than_since(&transcript.path)?
+            {
+                continue;
+            }
+            let file = self
+                .cursor
+                .files
+                .entry(transcript.path.clone())
+                .or_default();
+            let events = read_new_lines(&self.host, &transcript, file, &mut stats)?;
+            write_events(out, &events)?;
+        }
+        let live = read_registry(&self.root.join("sessions"))?;
+        let (events, next) = diff_registry(
+            &self.host,
+            &self.cursor.live,
+            &live,
+            is_alive,
+            Timestamp::now(),
+        );
+        write_events(out, &events)?;
+        stats.events = stats.events.saturating_add(events.len());
+        self.cursor.live = next;
+        out.flush()
+            .map_err(|source| CollectError::Write { source })?;
+        self.cursor.save(&self.cursor_path)?;
+        Ok(stats)
+    }
+
+    fn older_than_since(&self, path: &Path) -> Result<bool, CollectError> {
+        let Some(since) = self.since else {
+            return Ok(false);
+        };
+        let modified = fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map_err(|source| CollectError::Read {
+                path: path.to_owned(),
+                source,
+            })?;
+        Ok(modified < since)
+    }
+}
+
+fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, CollectError> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .map_err(|source| CollectError::Discover {
+                        path: dir.to_owned(),
+                        source,
+                    })
+            })
+            .collect(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(CollectError::Discover {
+            path: dir.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn jsonl_stem(path: &Path) -> Option<&str> {
+    (path.extension() == Some(OsStr::new("jsonl")))
+        .then(|| path.file_stem().and_then(OsStr::to_str))
+        .flatten()
+}
+
+fn discover(projects: &Path) -> Result<Vec<Transcript>, CollectError> {
+    let mut found = Vec::new();
+    for project in list_dir(projects)?.into_iter().filter(|p| p.is_dir()) {
+        for path in list_dir(&project)? {
+            if let Some(stem) = jsonl_stem(&path) {
+                found.push(Transcript {
+                    native: stem.to_owned(),
+                    session: SessionKey::new(Source::ClaudeCode, stem),
+                    parent: None,
+                    path: path.clone(),
+                });
+            } else if path.is_dir()
+                && let Some(parent_id) = path.file_name().and_then(OsStr::to_str)
+            {
+                let parent = SessionKey::new(Source::ClaudeCode, parent_id);
+                for sub in list_dir(&path.join("subagents"))? {
+                    if let Some(stem) = jsonl_stem(&sub) {
+                        found.push(Transcript {
+                            native: stem.to_owned(),
+                            session: SessionKey::new(Source::ClaudeCode, stem),
+                            parent: Some(parent.clone()),
+                            path: sub.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(found)
+}
+
+fn read_new_lines(
+    host: &Host,
+    transcript: &Transcript,
+    file: &mut FileState,
+    stats: &mut PollStats,
+) -> Result<Vec<Event>, CollectError> {
+    let path = &transcript.path;
+    let len = fs::metadata(path)
+        .map_err(|source| CollectError::Read {
+            path: path.clone(),
+            source,
+        })?
+        .len();
+    if len < file.offset {
+        *file = FileState::default();
+    }
+    if len == file.offset {
+        return Ok(Vec::new());
+    }
+    let mut handle = File::open(path).map_err(|source| CollectError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    handle
+        .seek(SeekFrom::Start(file.offset))
+        .map_err(|source| CollectError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    let mut buf = Vec::new();
+    handle
+        .read_to_end(&mut buf)
+        .map_err(|source| CollectError::Read {
+            path: path.clone(),
+            source,
+        })?;
+
+    let path_text = path.to_string_lossy();
+    let mut events = Vec::new();
+    let mut rest = buf.as_slice();
+    while let Some(newline) = rest.iter().position(|byte| *byte == b'\n') {
+        let (line, tail) = rest.split_at(newline);
+        rest = tail.get(1..).unwrap_or_default();
+        let offset = file.offset;
+        let ctx = LineContext {
+            host,
+            native_session: &transcript.native,
+            session: &transcript.session,
+            parent: transcript.parent.as_ref(),
+            path: &path_text,
+            offset,
+        };
+        let parsed = match std::str::from_utf8(line) {
+            Ok(text) if text.trim().is_empty() => Ok(Vec::new()),
+            Ok(text) => parse_line(&ctx, text, file).map_err(|err| err.to_string()),
+            Err(err) => Err(format!("{path_text}:{offset}: line is not UTF-8: {err}")),
+        };
+        match parsed {
+            Ok(mut found) => events.append(&mut found),
+            Err(message) => {
+                stats.parse_errors = stats.parse_errors.saturating_add(1);
+                tracing::warn!(path = %path_text, offset, %message, "skipping unparseable transcript line");
+                let body = Body::Error {
+                    class: ErrorClass::Parse,
+                    message: Snippet::new(&message),
+                };
+                events.push(build(
+                    &ctx,
+                    Timestamp::now(),
+                    format!("{offset}:parse"),
+                    body,
+                ));
+            }
+        }
+        file.offset = u64::try_from(newline)
+            .ok()
+            .and_then(|len| len.checked_add(1))
+            .and_then(|len| offset.checked_add(len))
+            .ok_or_else(|| CollectError::OffsetOverflow { path: path.clone() })?;
+    }
+    stats.events = stats.events.saturating_add(events.len());
+    Ok(events)
+}
+
+fn write_events(out: &mut impl Write, events: &[Event]) -> Result<(), CollectError> {
+    for event in events {
+        let line = event
+            .to_line()
+            .map_err(|source| CollectError::Encode { source })?;
+        writeln!(out, "{line}").map_err(|source| CollectError::Write { source })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+
+    use std::fs::{self, OpenOptions};
+    use std::time::{Duration, SystemTime};
+
+    use ovs_event::{Body, ErrorClass, Event, Host};
+
+    use super::*;
+
+    const LINE: &str = r#"{"type":"user","timestamp":"2026-10-20T05:00:00.000Z","sessionId":"s1","cwd":"/tmp/proj","message":{"role":"user","content":"hello"}}"#;
+
+    struct Env {
+        dir: tempfile::TempDir,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("claude/projects/-tmp-proj/s1/subagents")).unwrap();
+            Self { dir }
+        }
+
+        fn transcript(&self) -> PathBuf {
+            self.dir.path().join("claude/projects/-tmp-proj/s1.jsonl")
+        }
+
+        fn append(&self, path: &Path, text: &str) {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        }
+
+        fn collector(&self, since: Option<SystemTime>) -> Collector {
+            Collector::open(
+                self.dir.path().join("claude"),
+                Host::new("test-host"),
+                self.dir.path().join("state/cursor.json"),
+                since,
+            )
+            .unwrap()
+        }
+
+        fn poll(&self, collector: &mut Collector) -> Vec<Event> {
+            let mut out = Vec::new();
+            collector.poll(&mut out, |_| true).unwrap();
+            String::from_utf8(out)
+                .unwrap()
+                .lines()
+                .map(|l| Event::from_line(l).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn partial_lines_wait_for_their_newline() {
+        let env = Env::new();
+        let mut collector = env.collector(None);
+        let (head, tail) = LINE.split_at(40);
+        env.append(&env.transcript(), head);
+        assert!(env.poll(&mut collector).is_empty());
+        env.append(&env.transcript(), &format!("{tail}\n"));
+        let kinds: Vec<_> = env
+            .poll(&mut collector)
+            .iter()
+            .map(|e| e.body.kind())
+            .collect();
+        assert_eq!(kinds, ["session.started", "prompt"]);
+    }
+
+    #[test]
+    fn restart_resumes_from_the_cursor() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        assert_eq!(env.poll(&mut env.collector(None)).len(), 2);
+        assert!(env.poll(&mut env.collector(None)).is_empty());
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        let again = env.poll(&mut env.collector(None));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].body.kind(), "prompt");
+    }
+
+    #[test]
+    fn subagent_transcripts_carry_their_parent() {
+        let env = Env::new();
+        let sub = env
+            .dir
+            .path()
+            .join("claude/projects/-tmp-proj/s1/subagents/agent-a1.jsonl");
+        env.append(&sub, &format!("{LINE}\n"));
+        let events = env.poll(&mut env.collector(None));
+        assert_eq!(events[0].session.as_str(), "claude-code:agent-a1");
+        assert_eq!(
+            events[0].parent.as_ref().unwrap().as_str(),
+            "claude-code:s1"
+        );
+    }
+
+    #[test]
+    fn bad_lines_become_parse_errors_and_reading_continues() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{{broken\n{LINE}\n"));
+        let mut collector = env.collector(None);
+        let mut out = Vec::new();
+        let stats = collector.poll(&mut out, |_| true).unwrap();
+        assert_eq!(stats.parse_errors, 1);
+        let events: Vec<Event> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| Event::from_line(l).unwrap())
+            .collect();
+        assert!(matches!(
+            events[0].body,
+            Body::Error {
+                class: ErrorClass::Parse,
+                ..
+            }
+        ));
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn truncated_files_are_read_again() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{LINE}\n{LINE}\n"));
+        let mut collector = env.collector(None);
+        assert_eq!(env.poll(&mut collector).len(), 3);
+        fs::write(env.transcript(), format!("{LINE}\n")).unwrap();
+        assert_eq!(env.poll(&mut collector).len(), 2);
+    }
+
+    #[test]
+    fn since_skips_old_unseen_files() {
+        let env = Env::new();
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert!(env.poll(&mut env.collector(Some(future))).is_empty());
+    }
+}
