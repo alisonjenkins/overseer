@@ -6,6 +6,7 @@ members = [
     "crates/overseer-backends",
     "crates/overseer-orchestrator",
     "crates/overseer-cli",
+    "crates/ovs-event",
 ]
 
 [workspace.package]
