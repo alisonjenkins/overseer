@@ -1235,6 +1235,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ovs-state"
+version = "0.1.0"
+dependencies = [
+ "ovs-event",
+ "serde",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
