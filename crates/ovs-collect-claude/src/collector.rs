@@ -193,7 +193,8 @@ fn discover(projects: &Path) -> Result<Vec<Transcript>, CollectError> {
             }
         }
     }
-    found.sort_by(|a, b| a.path.cmp(&b.path));
+    // Byte order puts <sid>.jsonl before <sid>/subagents/, so a parent session is read before its subagents.
+    found.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
     Ok(found)
 }
 
