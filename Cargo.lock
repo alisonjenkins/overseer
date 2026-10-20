@@ -1223,6 +1223,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ovs-collect-claude"
+version = "0.1.0"
+dependencies = [
+ "ovs-event",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ovs-event"
 version = "0.1.0"
 dependencies = [
