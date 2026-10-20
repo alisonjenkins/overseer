@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use std::{fs, io};
 
 use ovs_event::{
@@ -16,7 +17,7 @@ pub struct LiveEntry {
     pub pid: u32,
     pub session_id: String,
     pub status: String,
-    pub status_updated_at: String,
+    pub status_updated_at: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,11 +75,16 @@ fn parse_entry(text: &str) -> Option<LiveEntry> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        status_updated_at: value
-            .get("statusUpdatedAt")
-            .map(Value::to_string)
-            .unwrap_or_default(),
+        status_updated_at: value.get("statusUpdatedAt").and_then(stamp_text),
     })
+}
+
+fn stamp_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 pub fn diff_registry(
@@ -94,8 +100,15 @@ pub fn diff_registry(
         if previous.get(&entry.session_id) != Some(entry)
             && let Some(state) = activity(&entry.status)
         {
-            let ts = updated_at(&entry.status_updated_at).unwrap_or(now);
-            let position = format!("status:{}", entry.status_updated_at);
+            let ts = entry
+                .status_updated_at
+                .as_deref()
+                .and_then(updated_at)
+                .unwrap_or(now);
+            let position = match &entry.status_updated_at {
+                Some(stamp) => format!("status:{stamp}"),
+                None => format!("status:{}:{}", entry.status, epoch_millis(now)),
+            };
             events.push(registry_event(
                 host,
                 &entry.session_id,
@@ -129,8 +142,14 @@ fn activity(status: &str) -> Option<ActivityState> {
 fn updated_at(raw: &str) -> Option<Timestamp> {
     match raw.parse::<i64>() {
         Ok(millis) => Timestamp::from_epoch_millis(millis).ok(),
-        Err(_) => Timestamp::parse(raw.trim_matches('"')).ok(),
+        Err(_) => Timestamp::parse(raw).ok(),
     }
+}
+
+fn epoch_millis(now: Timestamp) -> u128 {
+    now.to_system_time()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
 }
 
 fn registry_event(
@@ -182,6 +201,72 @@ mod tests {
         .unwrap();
     }
 
+    fn write_raw(dir: &Path, pid: u32, json: &str) {
+        fs::write(dir.join(format!("{pid}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn missing_updated_at_still_emits_distinct_status_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new("test-host");
+        let first_now = Timestamp::from_epoch_millis(1_792_474_400_000).unwrap();
+        let second_now = Timestamp::from_epoch_millis(1_792_474_405_000).unwrap();
+
+        write_raw(
+            dir.path(),
+            123,
+            r#"{"pid":123,"sessionId":"s123","status":"busy"}"#,
+        );
+        let (busy, live) = diff_registry(
+            &host,
+            &BTreeMap::new(),
+            &read_registry(dir.path()).unwrap(),
+            |_| true,
+            first_now,
+        );
+        write_raw(
+            dir.path(),
+            123,
+            r#"{"pid":123,"sessionId":"s123","status":"idle"}"#,
+        );
+        let (idle, _) = diff_registry(
+            &host,
+            &live,
+            &read_registry(dir.path()).unwrap(),
+            |_| true,
+            second_now,
+        );
+
+        assert_eq!(busy.len(), 1);
+        assert_eq!(idle.len(), 1);
+        assert_ne!(busy[0].id, idle[0].id);
+    }
+
+    #[test]
+    fn string_updated_at_is_unquoted_and_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new("test-host");
+        let now = Timestamp::from_epoch_millis(1_792_474_400_000).unwrap();
+
+        write_raw(
+            dir.path(),
+            123,
+            r#"{"pid":123,"sessionId":"s123","status":"busy","statusUpdatedAt":"2026-10-20T05:33:12.123Z"}"#,
+        );
+        let (events, _) = diff_registry(
+            &host,
+            &BTreeMap::new(),
+            &read_registry(dir.path()).unwrap(),
+            |_| true,
+            now,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].ts,
+            Timestamp::parse("2026-10-20T05:33:12.123Z").unwrap()
+        );
+    }
+
     #[test]
     fn missing_directory_is_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -197,7 +282,7 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].pid, 123);
         assert_eq!(live[0].session_id, "s123");
-        assert_eq!(live[0].status_updated_at, "1792474392123");
+        assert_eq!(live[0].status_updated_at.as_deref(), Some("1792474392123"));
     }
 
     #[test]
