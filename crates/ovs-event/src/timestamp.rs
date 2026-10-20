@@ -2,8 +2,13 @@ use std::fmt;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use time::format_description::BorrowedFormatItem;
 use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
+
+const FIXED_MILLIS: &[BorrowedFormatItem<'static>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
 /// A UTC instant, written as RFC 3339 with a `Z` offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -23,12 +28,12 @@ pub enum TimestampError {
 
 impl Timestamp {
     pub fn now() -> Self {
-        Self(OffsetDateTime::now_utc())
+        Self(truncate_to_millis(OffsetDateTime::now_utc()))
     }
 
     pub fn parse(value: &str) -> Result<Self, TimestampError> {
         OffsetDateTime::parse(value, &Rfc3339)
-            .map(|instant| Self(instant.to_offset(UtcOffset::UTC)))
+            .map(|instant| Self(truncate_to_millis(instant.to_offset(UtcOffset::UTC))))
             .map_err(|source| TimestampError::Parse {
                 value: value.to_owned(),
                 source,
@@ -40,7 +45,7 @@ impl Timestamp {
             .checked_mul(1_000_000)
             .ok_or(TimestampError::EpochRange { value })?;
         OffsetDateTime::from_unix_timestamp_nanos(nanos)
-            .map(Self)
+            .map(|instant| Self(truncate_to_millis(instant)))
             .map_err(|_| TimestampError::EpochRange { value })
     }
 
@@ -49,9 +54,15 @@ impl Timestamp {
     }
 }
 
+fn truncate_to_millis(instant: OffsetDateTime) -> OffsetDateTime {
+    instant
+        .replace_nanosecond(u32::from(instant.millisecond()).saturating_mul(1_000_000))
+        .unwrap_or(instant)
+}
+
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = self.0.format(&Rfc3339).map_err(|_| fmt::Error)?;
+        let text = self.0.format(FIXED_MILLIS).map_err(|_| fmt::Error)?;
         f.write_str(&text)
     }
 }
@@ -84,7 +95,18 @@ mod tests {
     #[test]
     fn normalises_offsets_to_utc() {
         let ts = Timestamp::parse("2026-10-20T07:33:12+02:00").unwrap();
-        assert_eq!(ts.to_string(), "2026-10-20T05:33:12Z");
+        assert_eq!(ts.to_string(), "2026-10-20T05:33:12.000Z");
+    }
+
+    #[test]
+    fn whole_seconds_keep_three_digits() {
+        let ts = Timestamp::parse("2026-10-20T05:33:12Z").unwrap();
+        assert_eq!(ts.to_string(), "2026-10-20T05:33:12.000Z");
+    }
+
+    #[test]
+    fn now_has_millisecond_width() {
+        assert_eq!(Timestamp::now().to_string().len(), 24);
     }
 
     #[test]
