@@ -14,3 +14,4 @@ Each file here records one architecture decision for overseer: what was chosen, 
 | [0008](0008-task-sources-through-a-tasksource-trait.md) | Task sources through a TaskSource trait | Accepted |
 | [0009](0009-sync-task-sources-only-while-the-worker-is-idle.md) | Sync task sources only while the worker is idle | Accepted |
 | [0010](0010-propose-lessons-without-automatic-application.md) | Propose lessons without automatic application | Accepted |
+| [0011](0011-compose-overseer-from-single-purpose-commands-over-an-event-stream.md) | Compose overseer from single-purpose commands over an event stream | Accepted |
