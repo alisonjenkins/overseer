@@ -110,7 +110,7 @@ impl Collector {
         let mut stats = PollStats::default();
         let mut cursor = self.cursor.clone();
         let mut reported = self.reported.clone();
-        let discovered = discover(&self.root.join("projects"))?;
+        let discovered = discover(&self.root.join("projects"), &mut stats)?;
         let known: HashSet<PathBuf> = discovered.iter().map(|t| t.path.clone()).collect();
         cursor.files.retain(|path, _| known.contains(path));
         reported.retain(|path| known.contains(path));
@@ -217,10 +217,22 @@ fn jsonl_stem(path: &Path) -> Option<&str> {
         .flatten()
 }
 
-fn discover(projects: &Path) -> Result<Vec<Transcript>, CollectError> {
+fn list_or_count(dir: &Path, stats: &mut PollStats) -> Vec<PathBuf> {
+    list_dir(dir).unwrap_or_else(|err| {
+        stats.read_errors = stats.read_errors.saturating_add(1);
+        tracing::warn!(
+            path = %dir.display(),
+            error = %err,
+            "skipping directory that cannot be listed"
+        );
+        Vec::new()
+    })
+}
+
+fn discover(projects: &Path, stats: &mut PollStats) -> Result<Vec<Transcript>, CollectError> {
     let mut found = Vec::new();
     for project in list_dir(projects)?.into_iter().filter(|p| p.is_dir()) {
-        for path in list_dir(&project)? {
+        for path in list_or_count(&project, stats) {
             if let Some(stem) = jsonl_stem(&path) {
                 found.push(Transcript {
                     native: stem.to_owned(),
@@ -232,7 +244,7 @@ fn discover(projects: &Path) -> Result<Vec<Transcript>, CollectError> {
                 && let Some(parent_id) = path.file_name().and_then(OsStr::to_str)
             {
                 let parent = SessionKey::new(Source::ClaudeCode, parent_id);
-                for sub in list_dir(&path.join("subagents"))? {
+                for sub in list_or_count(&path.join("subagents"), stats) {
                     if let Some(stem) = jsonl_stem(&sub) {
                         found.push(Transcript {
                             native: stem.to_owned(),
@@ -440,6 +452,22 @@ mod tests {
                 .map(|l| Event::from_line(l).unwrap())
                 .collect()
         }
+    }
+
+    #[test]
+    fn unlistable_project_is_skipped_and_counted() {
+        let env = Env::new();
+        let blocked = env.dir.path().join("claude/projects/-tmp-blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        env.append(&env.transcript(), &format!("{LINE}\n"));
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut collector = env.collector(None);
+        let mut out = Vec::new();
+        let result = collector.poll(&mut out, |_| true);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        let stats = result.unwrap();
+        assert_eq!(stats.read_errors, 1);
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2);
     }
 
     #[test]
