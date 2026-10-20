@@ -91,6 +91,12 @@ mod tests {
     }
 
     #[test]
+    fn derive_matches_known_vector() {
+        let id = EventId::derive(&Host::new("ali-desktop"), Source::ClaudeCode, "s1", "0:0");
+        assert_eq!(id.as_str(), "e5b55fb92b09f5148a091eb5453192ab");
+    }
+
+    #[test]
     fn derive_differs_by_position_and_host() {
         let host = Host::new("ali-desktop");
         let base = EventId::derive(&host, Source::ClaudeCode, "s1", "0:0");
