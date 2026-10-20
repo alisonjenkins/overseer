@@ -131,7 +131,7 @@ fn text_of(content: &Value) -> String {
     }
 }
 
-fn prompt_or_abort(text: &str) -> Body {
+fn prompt_or_abort(text: &str, by: PromptBy) -> Body {
     if text.starts_with(INTERRUPT_PREFIX) {
         Body::Error {
             class: ErrorClass::Aborted,
@@ -140,7 +140,7 @@ fn prompt_or_abort(text: &str) -> Body {
     } else {
         Body::Prompt {
             text: Snippet::new(text),
-            by: PromptBy::User,
+            by,
         }
     }
 }
@@ -152,13 +152,18 @@ fn user_events(ctx: &LineContext<'_>, ts: Timestamp, record: &Value, out: &mut V
     let Some(content) = record.get("message").and_then(|m| m.get("content")) else {
         return;
     };
+    let by = if ctx.parent.is_some() {
+        PromptBy::Agent
+    } else {
+        PromptBy::User
+    };
     match content {
         Value::String(text) => {
             out.push(build(
                 ctx,
                 ts,
                 format!("{}:0", ctx.offset),
-                prompt_or_abort(text),
+                prompt_or_abort(text, by),
             ));
         }
         Value::Array(blocks) => {
@@ -183,7 +188,7 @@ fn user_events(ctx: &LineContext<'_>, ts: Timestamp, record: &Value, out: &mut V
                     }
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            out.push(build(ctx, ts, position, prompt_or_abort(text)));
+                            out.push(build(ctx, ts, position, prompt_or_abort(text, by)));
                         }
                     }
                     _ => {}
@@ -630,6 +635,33 @@ mod tests {
         let input = tool_input(&events);
         assert!(input.contains(r#""Authorization":"[redacted]""#), "{input}");
         assert!(!input.contains("abc"), "{input}");
+    }
+
+    #[test]
+    fn subagent_prompts_are_attributed_to_the_parent_agent() {
+        let fx = Fixture::new();
+        let parent = SessionKey::new(Source::ClaudeCode, "s0");
+        let ctx = LineContext {
+            host: &fx.host,
+            native_session: "s1",
+            session: &fx.session,
+            parent: Some(&parent),
+            path: "/p/s1.jsonl",
+            offset: 0,
+        };
+        let events = parse_line(
+            &ctx,
+            PROMPT,
+            &mut FileState {
+                started: true,
+                ..FileState::default()
+            },
+        )
+        .unwrap();
+        let Body::Prompt { by, .. } = &events[0].body else {
+            unreachable!()
+        };
+        assert_eq!(*by, PromptBy::Agent);
     }
 
     #[test]
