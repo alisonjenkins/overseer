@@ -2,13 +2,14 @@ use std::collections::HashSet;
 
 use ovs_event::{
     ActivityState, Body, CallId, ErrorClass, Event, EventId, Host, PromptBy, SchemaVersion,
-    SessionKey, SessionStarted, Snippet, Source, SourceRef, Timestamp, Usage,
+    SessionKey, SessionStarted, Snippet, Source, SourceRef, Timestamp, Usage, redact,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
 const SYNTHETIC_MODEL: &str = "<synthetic>";
+const REDACTED: &str = "[redacted]";
 
 /// Read progress for one transcript file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +238,10 @@ fn assistant_events(
                     }
                 }
                 Some("tool_use") => {
-                    let input = block.get("input").map(Value::to_string).unwrap_or_default();
+                    let input = block
+                        .get("input")
+                        .map(|input| redact_json(input).to_string())
+                        .unwrap_or_default();
                     let body = Body::ToolCalled {
                         call_id: CallId::new(
                             block.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -267,6 +271,45 @@ fn assistant_events(
             format!("usage:{id}"),
             Body::Usage(usage_from(usage, model)),
         ));
+    }
+}
+
+const SECRET_KEY_MARKERS: [&str; 8] = [
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "apikey",
+    "api_key",
+    "api-key",
+    "cookie",
+];
+
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn redact_json(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact(text)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, entry)| {
+                    let redacted = if is_secret_key(key) {
+                        Value::String(REDACTED.to_owned())
+                    } else {
+                        redact_json(entry)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -327,6 +370,8 @@ mod tests {
     const API_ERROR: &str = r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-10-20T05:00:04.000Z","sessionId":"s1","cwd":"/tmp/proj","message":{"id":"msg_2","model":"<synthetic>","content":[{"type":"text","text":"API Error: 429"}]}}"#;
     const TURN_END: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":1200,"timestamp":"2026-10-20T05:00:05.000Z","sessionId":"s1","cwd":"/tmp/proj"}"#;
     const TITLE: &str = r#"{"type":"ai-title","aiTitle":"Parser fix"}"#;
+    const TOOL_QUOTED_SECRET: &str = r#"{"type":"assistant","timestamp":"2026-10-20T05:00:06.000Z","sessionId":"s1","cwd":"/tmp/proj","message":{"id":"msg_3","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"API_KEY=\"a b\" run"}}]}}"#;
+    const TOOL_SECRET_KEY: &str = r#"{"type":"assistant","timestamp":"2026-10-20T05:00:07.000Z","sessionId":"s1","cwd":"/tmp/proj","message":{"id":"msg_4","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_3","name":"WebFetch","input":{"headers":{"Authorization":"Bearer abc"},"url":"x"}}]}}"#;
 
     struct Fixture {
         host: Host,
@@ -545,6 +590,46 @@ mod tests {
             err.to_string()
                 .starts_with("/p/s1.jsonl:7: line is not JSON")
         );
+    }
+
+    fn tool_input(events: &[Event]) -> String {
+        match &events[0].body {
+            Body::ToolCalled { input, .. } => input.as_str().to_owned(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tool_input_quoted_secret_is_redacted() {
+        let fx = Fixture::new();
+        let events = fx.parse(
+            0,
+            TOOL_QUOTED_SECRET,
+            &mut FileState {
+                started: true,
+                ..FileState::default()
+            },
+        );
+        let input = tool_input(&events);
+        assert!(input.contains("[redacted]"), "{input}");
+        assert!(!input.contains("a b"), "{input}");
+        assert!(!input.contains(r#"b\""#), "{input}");
+    }
+
+    #[test]
+    fn tool_input_secret_keys_are_redacted() {
+        let fx = Fixture::new();
+        let events = fx.parse(
+            0,
+            TOOL_SECRET_KEY,
+            &mut FileState {
+                started: true,
+                ..FileState::default()
+            },
+        );
+        let input = tool_input(&events);
+        assert!(input.contains(r#""Authorization":"[redacted]""#), "{input}");
+        assert!(!input.contains("abc"), "{input}");
     }
 
     #[test]
