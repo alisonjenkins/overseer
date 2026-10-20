@@ -60,9 +60,13 @@ static COMPILED: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 #[serde(from = "String", into = "String")]
 pub struct Snippet(String);
 
+pub fn redact(text: &str) -> String {
+    apply_policy(text, &COMPILED, RULES.len())
+}
+
 impl Snippet {
     pub fn new(raw: &str) -> Self {
-        Self(truncate(&apply_policy(raw, &COMPILED, RULES.len())))
+        Self(truncate(&redact(raw)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -151,6 +155,13 @@ mod tests {
         for (raw, expected) in cases {
             assert_eq!(Snippet::new(raw).as_str(), expected, "input {raw:?}");
         }
+    }
+
+    #[test]
+    fn redact_applies_rules_without_truncating() {
+        assert_eq!(redact("API_KEY=x"), "API_KEY=[redacted]");
+        let long = "a".repeat(5000);
+        assert_eq!(redact(&long), long);
     }
 
     #[test]

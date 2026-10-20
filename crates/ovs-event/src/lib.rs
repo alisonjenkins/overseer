@@ -15,5 +15,5 @@ pub use event::{
     UnsupportedVersion,
 };
 pub use id::{EventId, EventIdError};
-pub use snippet::{SNIPPET_MAX_BYTES, Snippet};
+pub use snippet::{SNIPPET_MAX_BYTES, Snippet, redact};
 pub use timestamp::{Timestamp, TimestampError};
