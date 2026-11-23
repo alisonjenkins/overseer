@@ -327,7 +327,6 @@ async fn check_deep(profile: &Profile) -> Health {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -403,11 +402,22 @@ mod tests {
         path.to_path_buf()
     }
 
-    fn closed_port_url() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}/v1")
+    /// A loopback URL whose port stays bound, but not listening, while this
+    /// lives, so connecting to it is refused. Dropping a listener instead frees
+    /// the port, and a mock server in a parallel test can take it.
+    struct ClosedPort {
+        url: String,
+        _socket: tokio::net::TcpSocket,
+    }
+
+    fn closed_port() -> ClosedPort {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        ClosedPort {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            _socket: socket,
+        }
     }
 
     #[tokio::test]
@@ -541,7 +551,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_connection_refused_is_unreachable() {
-        let p = openai_profile(&closed_port_url());
+        let closed = closed_port();
+        let p = openai_profile(&closed.url);
         let health = check_profile(&p, false).await;
         assert_eq!(
             health,
@@ -574,7 +585,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_missing_api_key_env_fails_without_network() {
-        let mut p = openai_profile(&closed_port_url());
+        let closed = closed_port();
+        let mut p = openai_profile(&closed.url);
         p.api_key_env = Some("OVERSEER_TEST_NONEXISTENT_KEY_XYZ".to_owned());
 
         let health = check_profile_with(&p, false, None, None, |_| None).await;

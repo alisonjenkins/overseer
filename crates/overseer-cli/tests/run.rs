@@ -4,7 +4,6 @@
 //! wiremock server on 127.0.0.1; the repository and state directory are
 //! temp directories, so nothing outside the test is touched.
 
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -77,12 +76,22 @@ fn point_config_at(state_dir: &Path, base_url: &str) {
     std::fs::write(&config, text.replace(STARTER_BASE_URL, base_url)).unwrap();
 }
 
-/// A localhost port with nothing listening on it.
-fn closed_port_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}/v1")
+/// A loopback URL whose port stays bound, but not listening, while this
+/// lives, so connecting to it is refused. Dropping a listener instead frees
+/// the port, and a mock server in a parallel test can take it.
+struct ClosedPort {
+    url: String,
+    _socket: tokio::net::TcpSocket,
+}
+
+fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    ClosedPort {
+        url: format!("http://127.0.0.1:{port}/v1"),
+        _socket: socket,
+    }
 }
 
 struct Setup {
@@ -169,7 +178,8 @@ async fn init_add_run_show_reaches_review_with_transcript() {
 async fn unreachable_backend_blocks_the_task_and_records_why() {
     let fx = setup();
     stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
-    point_config_at(&fx.state, &closed_port_url());
+    let closed = closed_port();
+    point_config_at(&fx.state, &closed.url);
     stdout_of(&fx.state, &["task", "add", "write parser"]);
 
     let output = overseer(&fx.state)
@@ -255,6 +265,7 @@ fn write_config(state_dir: &Path, text: &str) {
 #[tokio::test]
 async fn attempts_fall_back_from_a_dead_local_server_to_agy() {
     let fx = setup();
+    let closed = closed_port();
     stdout_of(&fx.state, &["init", "--repo", fx.repo.to_str().unwrap()]);
     let agy = fake_agy(fx._root.path());
     write_config(
@@ -277,7 +288,7 @@ command = ["{agy}"]
 permissions = "write-workdir"
 "#,
             repo = fx.repo.display(),
-            dead = closed_port_url(),
+            dead = closed.url,
             agy = agy.display(),
         ),
     );
