@@ -402,7 +402,6 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use std::net::TcpListener;
     use std::path::PathBuf;
 
     use overseer_core::{BackendKind, Permissions};
@@ -461,12 +460,22 @@ mod tests {
         }))
     }
 
-    /// A localhost port with nothing listening on it.
-    fn closed_port_url() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}/v1")
+    /// A loopback URL whose port stays bound, but not listening, while this
+    /// lives, so connecting to it is refused. Dropping a listener instead frees
+    /// the port, and a mock server in a parallel test can take it.
+    struct ClosedPort {
+        url: String,
+        _socket: tokio::net::TcpSocket,
+    }
+
+    fn closed_port() -> ClosedPort {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        ClosedPort {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            _socket: socket,
+        }
     }
 
     async fn run_against(server: &MockServer, key: ApiKey) -> RunOutcome {
@@ -593,8 +602,8 @@ mod tests {
 
     #[tokio::test]
     async fn connection_refused_is_unreachable() {
-        let backend =
-            OpenAiBackend::from_parts(&profile(&closed_port_url(), 5), ApiKey::None).unwrap();
+        let closed = closed_port();
+        let backend = OpenAiBackend::from_parts(&profile(&closed.url, 5), ApiKey::None).unwrap();
         let outcome = backend.run(&request()).await.unwrap();
         assert_eq!(outcome.failure, Some(FailureKind::Unreachable));
     }
@@ -615,8 +624,9 @@ mod tests {
     async fn missing_api_key_variable_fails_without_sending_a_request() {
         // The endpoint is closed, so a request would be Unreachable. Getting
         // AuthRequired proves nothing was sent.
+        let closed = closed_port();
         let backend = OpenAiBackend::from_parts(
-            &profile(&closed_port_url(), 5),
+            &profile(&closed.url, 5),
             ApiKey::MissingEnv("OVERSEER_TEST_UNSET_KEY".to_owned()),
         )
         .unwrap();
