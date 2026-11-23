@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -21,11 +20,22 @@ fn write_script(path: &Path, body: &str) -> PathBuf {
     path.to_path_buf()
 }
 
-fn closed_port_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}/v1")
+/// A loopback URL whose port stays bound, but not listening, while this
+/// lives, so connecting to it is refused. Dropping a listener instead frees
+/// the port, and a mock server in a parallel test can take it.
+struct ClosedPort {
+    url: String,
+    _socket: tokio::net::TcpSocket,
+}
+
+fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    ClosedPort {
+        url: format!("http://127.0.0.1:{port}/v1"),
+        _socket: socket,
+    }
 }
 
 #[tokio::test]
@@ -97,6 +107,7 @@ command = ["{}"]
 #[test]
 fn doctor_unusable_default_plan_exits_2() {
     let temp = tempfile::tempdir().unwrap();
+    let closed = closed_port();
     let state_dir = temp.path().join("state");
     overseer(&state_dir).arg("init").assert().success();
 
@@ -111,7 +122,7 @@ base_url = "{}"
 model = "broken"
 "#,
         temp.path().display(),
-        closed_port_url()
+        closed.url
     );
     std::fs::write(state_dir.join("overseer.toml"), config_content).unwrap();
 
